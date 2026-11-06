@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <rect width="1024" height="1024" rx="224" fill="#0d0a0a"/>
+  <rect x="104" y="104" width="816" height="816" rx="144" fill="#ffffff"/>
+  <path d="M104 324h816M104 700h816" stroke="#e0e0e0" stroke-width="12"/>
+  <path d="M324 104v816M700 104v816" stroke="#ededed" stroke-width="8"/>
+  <text x="512" y="638" fill="#0d0a0a" font-family="Times New Roman, Times, serif"
+        font-size="188" font-weight="700" text-anchor="middle">Zoid B</text>
+  <rect x="744" y="744" width="120" height="120" fill="#c23a2e"/>
+  <path d="M768 804h72M804 768v72" stroke="#ffffff" stroke-width="16"/>
+</svg>

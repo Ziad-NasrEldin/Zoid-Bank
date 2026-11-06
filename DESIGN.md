@@ -12,6 +12,10 @@ This file defines Zoid Bank product language, workflow patterns, and approved lo
 
 Zoid Bank must document any intentional deviation from the global component and token contract here.
 
+Standard dropdown triggers use a 42px minimum height to align with Zoid Bank text and date fields.
+
+Compact dropdown triggers and menu options retain the canonical 34px minimum height.
+
 ## Source system
 
 Zoid Bank now adapts the Master Lance Sumi-Ink Command System for a private finance ledger.

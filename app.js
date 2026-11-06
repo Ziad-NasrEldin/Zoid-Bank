@@ -1,7 +1,7 @@
 /* Prototype question: which local-first finance dashboard state best supports a calm daily review?
    Six states live on one route and are shareable with ?variant=overview|transactions|analytics|cash-flow|review|recurring. */
 
-import { createHarborLedger } from './harbor-ledger.js';
+import { createHarborLedger, createMemoryStorage } from './harbor-ledger.js';
 import {
   addDays,
   createManualRecurringRule,
@@ -11,10 +11,47 @@ import {
   toISODate,
   updateManualRecurringRule
 } from './harbor-recurring.js';
+import {
+  LEDGER_STORAGE_KEY,
+  mergeLedgerSnapshots,
+  normalizeLedgerSnapshot,
+  sortTransactionRecords,
+  summarizeScanResults,
+  updateReviewCandidateSnapshot
+} from './harbor-ledger-sync.js';
+import { replaceStorageSnapshot } from './harbor-storage.js';
+import { downloadTransactionsWorkbook } from './transaction-export.js';
 
 const app = document.querySelector('#app');
-const harborLedger = createHarborLedger();
+const ledgerStorage = window.localStorage;
+let harborLedger = createHarborLedger(ledgerStorage);
 const MANUAL_RECURRING_STORAGE_KEY = 'harbor.manual-recurring.v1';
+const DISMISSED_RECURRING_STORAGE_KEY = 'harbor.dismissed-recurring.v1';
+const SIDEBAR_COLLAPSED_STORAGE_KEY = 'harbor.sidebar-collapsed.v1';
+const DISPLAY_CURRENCY_STORAGE_KEY = 'harbor.display-currency.v1';
+const FX_RATES_STORAGE_KEY = 'harbor.fx-rates.v1';
+const SIDEBAR_COLLAPSE_MEDIA_QUERY = '(min-width: 941px)';
+const TRANSACTIONS_PER_PAGE = 10;
+
+function canonicalLedgerSnapshot(snapshot) {
+  return normalizeLedgerSnapshot(snapshot, { allowLegacy: true });
+}
+
+function durableLedgerSnapshot(ledger = harborLedger) {
+  return canonicalLedgerSnapshot(ledger.durableSnapshot());
+}
+
+function migrateBrowserLedgerCache() {
+  const beforeRaw = ledgerStorage.getItem(LEDGER_STORAGE_KEY);
+  const canonical = durableLedgerSnapshot();
+  const canonicalRaw = JSON.stringify(canonical);
+  if (canonicalRaw !== beforeRaw) replaceStorageSnapshot(ledgerStorage, LEDGER_STORAGE_KEY, canonical);
+  harborLedger = createHarborLedger(ledgerStorage);
+}
+
+migrateBrowserLedgerCache();
+
+document.documentElement.classList.toggle('native-shell', window.location.protocol === 'harbor:');
 
 function loadManualRecurringRules() {
   try {
@@ -26,12 +63,90 @@ function loadManualRecurringRules() {
   }
 }
 
+function loadJsonStorageValue(key, fallback) {
+  try {
+    const saved = window.localStorage.getItem(key);
+    return saved ? JSON.parse(saved) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function loadDisplayCurrency() {
+  try {
+    return window.localStorage.getItem(DISPLAY_CURRENCY_STORAGE_KEY) || 'EGP';
+  } catch {
+    return 'EGP';
+  }
+}
+
+function loadFxRates() {
+  const saved = loadJsonStorageValue(FX_RATES_STORAGE_KEY, {});
+  if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return {};
+  return Object.fromEntries(Object.entries(saved)
+    .filter(([code, rate]) => ['USD', 'EUR'].includes(code) && Number.isFinite(Number(rate)) && Number(rate) > 0)
+    .map(([code, rate]) => [code, Number(rate)]));
+}
+
+function persistDisplayCurrency(code) {
+  try {
+    window.localStorage.setItem(DISPLAY_CURRENCY_STORAGE_KEY, code);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function persistFxRates(rates) {
+  try {
+    window.localStorage.setItem(FX_RATES_STORAGE_KEY, JSON.stringify(rates));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function persistManualRecurringRules(rules) {
   try {
     window.localStorage.setItem(MANUAL_RECURRING_STORAGE_KEY, JSON.stringify(rules));
     return true;
   } catch {
     return false;
+  }
+}
+
+function loadDismissedRecurringPatternIds() {
+  try {
+    const saved = window.localStorage.getItem(DISMISSED_RECURRING_STORAGE_KEY);
+    const parsed = saved ? JSON.parse(saved) : [];
+    return Array.isArray(parsed) ? parsed.filter((id) => typeof id === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistDismissedRecurringPatternIds(ids) {
+  try {
+    window.localStorage.setItem(DISMISSED_RECURRING_STORAGE_KEY, JSON.stringify(ids));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function loadSidebarCollapsed() {
+  try {
+    return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+function persistSidebarCollapsed(collapsed) {
+  try {
+    window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, String(collapsed));
+  } catch {
+    // The sidebar still works when local browser storage is unavailable.
   }
 }
 
@@ -47,6 +162,7 @@ const views = [
 
 const state = {
   view: getViewFromUrl(),
+  transactionDetailId: getTransactionIdFromUrl(),
   isEditing: false,
   reviewCandidateId: null,
   toast: '',
@@ -56,21 +172,32 @@ const state = {
   editingRecurringRuleId: null,
   manualTransactions: [],
   manualRecurringRules: loadManualRecurringRules(),
+  dismissedRecurringPatternIds: loadDismissedRecurringPatternIds(),
+  sidebarCollapsed: loadSidebarCollapsed(),
   transactionFilter: 'all',
+  transactionCategory: 'all',
   transactionQuery: '',
+  transactionPage: 1,
   trendTimeframe: '4',
-  displayCurrency: 'EGP'
+  displayCurrency: loadDisplayCurrency(),
+  fxRates: loadFxRates()
 };
 
 const DISPLAY_CURRENCIES = [
-  { code: 'EGP', name: 'Egyptian pound', egpPerUnit: 1 },
-  { code: 'USD', name: 'US dollar', egpPerUnit: 50 },
-  { code: 'EUR', name: 'Euro', egpPerUnit: 54 }
+  { code: 'EGP', name: 'Egyptian pound' },
+  { code: 'USD', name: 'US dollar' },
+  { code: 'EUR', name: 'Euro' }
 ];
 
 const DISPLAY_CURRENCY_BY_CODE = Object.fromEntries(
   DISPLAY_CURRENCIES.map((currency) => [currency.code, currency])
 );
+
+if (!DISPLAY_CURRENCY_BY_CODE[state.displayCurrency]
+  || (state.displayCurrency !== 'EGP' && !state.fxRates[state.displayCurrency])) {
+  state.displayCurrency = 'EGP';
+  persistDisplayCurrency('EGP');
+}
 
 const overviewTrendRanges = {
   1: { label: '1 week', days: 7 },
@@ -108,7 +235,8 @@ const iconPaths = {
   bolt: '<path d="m13 2-8 11h6l-1 9 8-11h-6l1-9Z"/>',
   alert: '<path d="M12 4 21 20H3L12 4Z"/><path d="M12 10v4M12 17h.01"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
-  search: '<circle cx="10.8" cy="10.8" r="6.3"/><path d="m16 16 4 4"/>'
+  search: '<circle cx="10.8" cy="10.8" r="6.3"/><path d="m16 16 4 4"/>',
+  close: '<path d="m6 6 12 12M18 6 6 18"/>'
 };
 
 function icon(name, size = 18) {
@@ -116,24 +244,45 @@ function icon(name, size = 18) {
 }
 
 function getViewFromUrl() {
-  const requested = new URLSearchParams(window.location.search).get('variant');
+  const params = new URLSearchParams(window.location.search);
+  const requested = params.get('variant');
+  if (requested === 'transaction' && params.get('id')) return 'transaction';
   return views.some((view) => view.id === requested) ? requested : 'overview';
 }
 
+function getTransactionIdFromUrl() {
+  return new URLSearchParams(window.location.search).get('id') || null;
+}
+
+function transactionDetailUrl(transactionId) {
+  return `?variant=transaction&id=${encodeURIComponent(transactionId)}`;
+}
+
 function currencyDefinition(code) {
-  return DISPLAY_CURRENCY_BY_CODE[code] || DISPLAY_CURRENCY_BY_CODE.EGP;
+  const definition = DISPLAY_CURRENCY_BY_CODE[code] || DISPLAY_CURRENCY_BY_CODE.EGP;
+  return {
+    ...definition,
+    egpPerUnit: definition.code === 'EGP' ? 1 : state.fxRates[definition.code] || null
+  };
 }
 
 function convertCurrency(value, sourceCurrency = 'EGP', targetCurrency = state.displayCurrency) {
   const amount = Number(value) || 0;
   const source = currencyDefinition(sourceCurrency);
   const target = currencyDefinition(targetCurrency);
+  if (source.code === target.code) return amount;
+  if (source.code !== target.code && (!source.egpPerUnit || !target.egpPerUnit)) return null;
   return amount * source.egpPerUnit / target.egpPerUnit;
 }
 
 function formatCurrency(value, sourceCurrency = 'EGP') {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return 'Unavailable';
+  const source = currencyDefinition(sourceCurrency);
   const targetCurrency = currencyDefinition(state.displayCurrency);
   const convertedAmount = convertCurrency(value, sourceCurrency, targetCurrency.code);
+  if (convertedAmount === null) {
+    return `${source.code} ${Number(value).toLocaleString('en-EG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} · rate unavailable`;
+  }
   return `${targetCurrency.code} ${convertedAmount.toLocaleString('en-EG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
@@ -143,14 +292,33 @@ function signedCurrency(value, sourceCurrency = 'EGP', direction = '') {
   return `${sign}${formatCurrency(Math.abs(amount), sourceCurrency)}`;
 }
 
-function currencyOptions() {
-  return DISPLAY_CURRENCIES.map((currency) => `<option value="${currency.code}"${state.displayCurrency === currency.code ? ' selected' : ''}>${currency.code} · ${currency.name}</option>`).join('');
-}
-
 function currencySelect(id) {
   const currency = currencyDefinition(state.displayCurrency);
-  const rateNote = currency.code === 'EGP' ? 'Base currency' : `EGP ${currency.egpPerUnit.toFixed(0)} = 1 ${currency.code}`;
-  return `<label class="currency-control" for="${id}"><span>Display currency</span><select id="${id}" data-display-currency aria-label="Display currency">${currencyOptions()}</select><small>Prototype rate · ${rateNote}</small></label>`;
+  const availableCurrencies = DISPLAY_CURRENCIES.filter((item) => item.code === 'EGP' || state.fxRates[item.code]);
+  const selectedCode = availableCurrencies.some((item) => item.code === state.displayCurrency) ? state.displayCurrency : 'EGP';
+  const rateNote = currency.code === 'EGP'
+    ? 'Base currency'
+    : currency.egpPerUnit
+      ? `Manual rate · EGP ${currency.egpPerUnit.toFixed(2)} = 1 ${currency.code}`
+      : 'No manual rate saved';
+  return `<div class="currency-control">${sumiDropdown({
+    id,
+    label: 'Display currency',
+    value: selectedCode,
+    options: availableCurrencies.map((item) => ({ value: item.code, label: `${item.code} · ${item.name}` })),
+    inputAttributes: 'data-display-currency'
+  })}<small>${rateNote}</small></div>`;
+}
+
+function sumiDropdown({ id, label, value, options, inputAttributes = '', className = '' }) {
+  const selectedOption = options.find((option) => String(option.value) === String(value)) || options[0];
+  const labelId = `${id}-label`;
+  const menuId = `${id}-menu`;
+  const optionMarkup = options.map((option) => {
+    const selected = String(option.value) === String(selectedOption.value);
+    return `<button class="sumi-dropdown__option" type="button" role="option" data-sumi-dropdown-value="${escapeHtml(option.value)}" aria-selected="${selected}"><span>${escapeHtml(option.label)}</span><span class="sumi-dropdown__state">${selected ? 'SELECTED' : ''}</span></button>`;
+  }).join('');
+  return `<div class="sumi-dropdown ${className}" data-sumi-dropdown><span class="sumi-dropdown__label" id="${labelId}">${escapeHtml(label)}</span><input type="hidden" id="${id}" value="${escapeHtml(selectedOption.value)}" ${inputAttributes} /><button class="sumi-dropdown__trigger" id="${id}-trigger" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="${menuId}" aria-labelledby="${labelId} ${id}-value"><span class="sumi-dropdown__value" id="${id}-value">${escapeHtml(selectedOption.label)}</span><span class="sumi-dropdown__chevron">${icon('chevronDown', 14)}</span></button><div class="sumi-dropdown__menu" id="${menuId}" role="listbox" aria-labelledby="${labelId}" hidden>${optionMarkup}</div></div>`;
 }
 
 function formatProjectionDate(value, fallback = 'Not available') {
@@ -183,20 +351,75 @@ function reviewCandidateAmount(candidate) {
   return signedCurrency(signedAmount, candidate.currency || 'EGP', candidate.direction || 'debit');
 }
 
+function sumConverted(items, valueForItem, targetCurrency = 'EGP') {
+  let total = 0;
+  for (const item of items) {
+    const converted = convertCurrency(valueForItem(item), item.currency || 'EGP', targetCurrency);
+    if (converted === null) return null;
+    total += converted;
+  }
+  return total;
+}
+
+function nativeCurrencyTotals(items = []) {
+  const totals = new Map();
+  for (const item of items) {
+    const amount = Number(item?.amount);
+    if (!Number.isFinite(amount)) continue;
+    const currency = String(item?.currency || 'EGP').trim().toUpperCase() || 'EGP';
+    totals.set(currency, (totals.get(currency) || 0) + amount);
+  }
+  return [...totals.entries()]
+    .map(([currency, total]) => ({ currency, total }))
+    .sort((left, right) => {
+      if (left.currency === state.displayCurrency) return -1;
+      if (right.currency === state.displayCurrency) return 1;
+      if (left.currency === 'EGP') return -1;
+      if (right.currency === 'EGP') return 1;
+      return left.currency.localeCompare(right.currency);
+    });
+}
+
+function formatNativeCurrencyTotal({ currency, total }) {
+  return `${currency} ${total.toLocaleString('en-EG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function canDisplayConvertedSpending(convertedTotal) {
+  if (convertedTotal === null) return false;
+  return !/unavailable/i.test(formatCurrency(convertedTotal));
+}
+
+function approvedSpendingText(debits, convertedTotal) {
+  if (canDisplayConvertedSpending(convertedTotal)) return formatCurrency(convertedTotal);
+  const totals = nativeCurrencyTotals(debits).map(formatNativeCurrencyTotal);
+  return totals.length ? totals.join(' + ') : formatCurrency(0);
+}
+
+function approvedSpendingMarkup(debits, convertedTotal) {
+  if (canDisplayConvertedSpending(convertedTotal)) return escapeHtml(formatCurrency(convertedTotal));
+  const totals = nativeCurrencyTotals(debits);
+  if (!totals.length) return escapeHtml(formatCurrency(0));
+  return totals.map((total, index) => `<span class="${index ? 'position-value-secondary' : 'position-value-primary'}">${escapeHtml(formatNativeCurrencyTotal(total))}</span>`).join('');
+}
+
 function liveLedgerSummary() {
   const snapshot = harborLedger.snapshot();
   const approved = snapshot.events || [];
   const reviews = snapshot.reviewCandidates || [];
   const debits = approved.filter((event) => (event.direction || 'debit') === 'debit');
   const credits = approved.filter((event) => event.direction === 'credit');
-  const debitTotal = debits.reduce((sum, event) => sum + convertCurrency(event.amount, event.currency || 'EGP', 'EGP'), 0);
-  const creditTotal = credits.reduce((sum, event) => sum + convertCurrency(event.amount, event.currency || 'EGP', 'EGP'), 0);
+  const debitTotal = sumConverted(debits, (event) => event.amount, 'EGP');
+  const creditTotal = sumConverted(credits, (event) => event.amount, 'EGP');
   const categories = debits.reduce((map, event) => {
     const category = event.category || 'Other';
-    map[category] = (map[category] || 0) + convertCurrency(event.amount, event.currency || 'EGP', 'EGP');
+    const converted = convertCurrency(event.amount, event.currency || 'EGP', 'EGP');
+    if (converted !== null) map[category] = (map[category] || 0) + converted;
     return map;
   }, {});
-  return { snapshot, approved, reviews, debits, credits, debitTotal, creditTotal, categories };
+  const unavailableCurrencies = [...new Set(debits.concat(credits)
+    .filter((event) => convertCurrency(event.amount, event.currency || 'EGP', 'EGP') === null)
+    .map((event) => event.currency || 'EGP'))];
+  return { snapshot, approved, reviews, debits, credits, debitTotal, creditTotal, categories, unavailableCurrencies };
 }
 
 function categoryAmount(categories, aliases) {
@@ -225,7 +448,8 @@ function observedTrend(debits, selectedRange) {
     const eventDate = new Date(`${date}T12:00:00Z`);
     const offset = Math.floor((eventDate - start) / 86400000);
     const bucket = Math.floor(offset / daysPerSlot);
-    if (bucket >= 0 && bucket < buckets.length) buckets[bucket].total += convertCurrency(event.amount, event.currency || 'EGP', 'EGP');
+    const converted = convertCurrency(event.amount, event.currency || 'EGP', 'EGP');
+    if (bucket >= 0 && bucket < buckets.length && converted !== null) buckets[bucket].total += converted;
   });
   const highest = Math.max(...buckets.map((bucket) => bucket.total), 0);
   return {
@@ -242,17 +466,190 @@ function categoryBreakdown(categories, total) {
     .sort((left, right) => right.amount - left.amount);
 }
 
+function stageLedgerFromSnapshot(snapshot) {
+  const storage = createMemoryStorage();
+  storage.setItem(LEDGER_STORAGE_KEY, JSON.stringify(canonicalLedgerSnapshot(snapshot)));
+  return { storage, ledger: createHarborLedger(storage) };
+}
+
+function exposeLedgerBridge() {
+  window.__harborLedger = harborLedger;
+  window.__harborGetLedgerSnapshot = () => durableLedgerSnapshot();
+  window.__harborReplaceLedgerSnapshot = (snapshot, options = {}) => replaceLedgerSnapshot(snapshot, options);
+  window.__harborApplyMessageBatch = (messages) => applyMessageBatch(messages);
+  window.__harborApproveReviewCandidate = (candidateId, input = null) => approveReviewCandidate(candidateId, input);
+  window.__harborDismissReviewCandidate = (candidateId) => dismissReviewCandidate(candidateId);
+}
+
+function notifyLedgerChanged(snapshot) {
+  if (typeof window.__harborLedgerChanged !== 'function') return;
+  Promise.resolve(window.__harborLedgerChanged(snapshot)).catch(() => {
+    // The service sync surface reports its own failure without changing local state.
+  });
+}
+
+function replaceLedgerSnapshot(snapshot, { notifyRemote = true, renderNow = true } = {}) {
+  replaceStorageSnapshot(ledgerStorage, LEDGER_STORAGE_KEY, canonicalLedgerSnapshot(snapshot));
+  harborLedger = createHarborLedger(ledgerStorage);
+  exposeLedgerBridge();
+  if (notifyRemote) notifyLedgerChanged(durableLedgerSnapshot());
+  if (renderNow) render();
+  return canonicalLedgerSnapshot(harborLedger.snapshot());
+}
+
+function applyMessageBatch(messages = []) {
+  const beforeSnapshot = durableLedgerSnapshot();
+  const beforeRaw = ledgerStorage.getItem(LEDGER_STORAGE_KEY);
+  const { storage, ledger } = stageLedgerFromSnapshot(beforeSnapshot);
+  const results = [];
+  try {
+    for (const message of messages) {
+      try {
+        results.push(ledger.ingest(message));
+      } catch (error) {
+        results.push({ kind: 'failed', error: error instanceof Error ? error.message : 'The message could not be ingested.' });
+        const batchError = new Error('The local ledger was not changed because one message could not be saved.');
+        batchError.cause = error;
+        batchError.scanSummary = summarizeScanResults(results, messages.length);
+        throw batchError;
+      }
+    }
+    const nextSnapshot = canonicalLedgerSnapshot(JSON.parse(storage.getItem(LEDGER_STORAGE_KEY)));
+    try {
+      replaceLedgerSnapshot(nextSnapshot, { notifyRemote: true, renderNow: true });
+    } catch (error) {
+      if (beforeRaw === null) ledgerStorage.removeItem(LEDGER_STORAGE_KEY);
+      else ledgerStorage.setItem(LEDGER_STORAGE_KEY, beforeRaw);
+      harborLedger = createHarborLedger(ledgerStorage);
+      exposeLedgerBridge();
+      throw error;
+    }
+    return { results, snapshot: nextSnapshot, summary: summarizeScanResults(results, messages.length) };
+  } catch (error) {
+    if (error.scanSummary) throw error;
+    const batchError = new Error('The local ledger was not changed because the scan could not be completed.');
+    batchError.cause = error;
+    batchError.scanSummary = summarizeScanResults(results, messages.length);
+    throw batchError;
+  }
+}
+
+function approveReviewCandidate(candidateId, input = null) {
+  let snapshot = durableLedgerSnapshot();
+  let staged = stageLedgerFromSnapshot(snapshot);
+  const supportsCandidateEditEvidence = typeof staged.ledger.editCandidate === 'function';
+  if (input && !supportsCandidateEditEvidence) {
+    // Keep the compatibility path for the legacy fixture ledger. The v2 ledger
+    // path below must receive overrides directly so it appends edit evidence.
+    snapshot = updateReviewCandidateSnapshot(snapshot, candidateId, input);
+    staged = stageLedgerFromSnapshot(snapshot);
+  }
+  const result = staged.ledger.approveCandidate(
+    candidateId,
+    supportsCandidateEditEvidence ? (input || {}) : undefined
+  );
+  if (result.kind === 'approved' || result.kind === 'invalid') {
+    // Invalid attempts can contain saved field edits plus append-only rejection
+    // evidence. Commit that staged state without creating an approved event.
+    replaceLedgerSnapshot(JSON.parse(staged.storage.getItem(LEDGER_STORAGE_KEY)), { notifyRemote: true, renderNow: true });
+  }
+  return result;
+}
+
+function dismissReviewCandidate(candidateId) {
+  const staged = stageLedgerFromSnapshot(durableLedgerSnapshot());
+  const result = staged.ledger.dismissCandidate(candidateId);
+  if (result.kind === 'dismissed') {
+    replaceLedgerSnapshot(staged.ledger.durableSnapshot(), { notifyRemote: true, renderNow: true });
+  }
+  return result;
+}
+
+const REVIEW_FIELD_REASON_PATTERNS = [
+  { field: 'merchant', pattern: /merchant|description/i },
+  { field: 'amount', pattern: /amount/i },
+  { field: 'date', pattern: /date/i },
+  { field: 'category', pattern: /category/i }
+];
+
+function reviewFieldForReason(reason) {
+  const match = REVIEW_FIELD_REASON_PATTERNS.find(({ pattern }) => pattern.test(String(reason || '')));
+  return match?.field || null;
+}
+
+function firstInvalidReviewField(reasons = []) {
+  return (Array.isArray(reasons) ? reasons : [reasons]).map(reviewFieldForReason).find(Boolean) || null;
+}
+
+function reviewApprovalFailureMessage(result) {
+  if (result?.kind === 'invalid') {
+    const reasons = Array.isArray(result.reasons) && result.reasons.length
+      ? result.reasons
+      : ['Ledger validation failed. Review the fields and try again.'];
+    return `Approval blocked: ${reasons.join(' · ')}`;
+  }
+  if (result?.kind === 'missing') return 'This review item is no longer available.';
+  return 'Approval could not be completed. Review this item and try again.';
+}
+
+function focusReviewField(reasons = []) {
+  const field = firstInvalidReviewField(reasons);
+  if (!field) return;
+  const input = document.querySelector(`[data-review-field="${field}"]`);
+  input?.focus();
+  input?.select?.();
+}
+
 function setView(viewId) {
   if (!views.some((view) => view.id === viewId)) return;
   state.view = viewId;
+  state.transactionDetailId = null;
   state.isEditing = false;
   const url = new URL(window.location.href);
   url.searchParams.set('variant', viewId);
+  url.searchParams.delete('id');
   window.history.replaceState({}, '', url);
   render();
 }
 
+function isSidebarCollapsed() {
+  return state.sidebarCollapsed && window.matchMedia(SIDEBAR_COLLAPSE_MEDIA_QUERY).matches;
+}
+
+function setSidebarCollapsed(collapsed) {
+  state.sidebarCollapsed = collapsed;
+  persistSidebarCollapsed(collapsed);
+
+  const isCollapsed = isSidebarCollapsed();
+  const shell = document.querySelector('.app-shell');
+  const sidebarPanel = document.querySelector('[data-sidebar-panel]');
+  const sidebarRail = document.querySelector('[data-sidebar-rail-nav]');
+  const toggle = document.querySelector('[data-sidebar-toggle]');
+
+  shell?.classList.toggle('sidebar-collapsed', isCollapsed);
+  sidebarPanel?.setAttribute('aria-hidden', String(isCollapsed));
+  sidebarPanel?.toggleAttribute('inert', isCollapsed);
+  sidebarRail?.setAttribute('aria-hidden', String(!isCollapsed));
+  sidebarRail?.toggleAttribute('inert', !isCollapsed);
+  sidebarPanel?.querySelectorAll('[data-sidebar-panel-item]').forEach((item) => {
+    item.tabIndex = isCollapsed ? -1 : 0;
+  });
+  sidebarRail?.querySelectorAll('[data-sidebar-rail-item]').forEach((item) => {
+    item.tabIndex = isCollapsed ? 0 : -1;
+  });
+  if (toggle) {
+    toggle.setAttribute('aria-label', isCollapsed ? 'Maximize sidebar' : 'Minimize sidebar');
+    toggle.setAttribute('aria-expanded', String(!isCollapsed));
+    toggle.setAttribute('title', isCollapsed ? 'Maximize sidebar' : 'Minimize sidebar');
+    toggle.classList.toggle('sidebar-toggle--open', isCollapsed);
+    toggle.classList.toggle('sidebar-toggle--close', !isCollapsed);
+  }
+}
+
 function currentView() {
+  if (state.view === 'transaction') {
+    return { id: 'transaction', key: 'B', label: 'Transaction details', icon: 'transactions' };
+  }
   return views.find((view) => view.id === state.view) || views[0];
 }
 
@@ -266,27 +663,50 @@ function showToast(message) {
   }, 3600);
 }
 
-function renderSidebar() {
+function renderSidebarNavItem(view, { compact = false, collapsed = false } = {}) {
+  const isReview = view.id === 'review';
   const openReviews = harborLedger.snapshot().reviewCandidates.length;
-  const nav = views.filter((view) => view.id !== 'settings').map((view) => {
-    const isReview = view.id === 'review';
-    return `<button class="nav-item" data-view="${view.id}" aria-current="${state.view === view.id ? 'page' : 'false'}">
-      ${icon(view.icon, 17)}
-      <span>${view.label}</span>
-      ${isReview ? '<span class="nav-count">' + openReviews + '</span>' : ''}
+  const isCurrent = state.view === view.id || (state.view === 'transaction' && view.id === 'transactions');
+  const label = escapeHtml(view.label);
+  const count = compact
+    ? (isReview && openReviews > 0 ? `<span class="sidebar-rail-count">${openReviews}</span>` : '')
+    : (isReview && openReviews > 0 ? '<span class="nav-count">' + openReviews + '</span>' : '');
+
+  if (compact) {
+    return `<button class="sidebar-rail-item" data-sidebar-rail-item data-view="${view.id}" aria-current="${isCurrent ? 'page' : 'false'}" aria-label="${label}" title="${label}" tabindex="${collapsed ? '0' : '-1'}">
+      ${icon(view.icon, 17)}<span class="sr-only">${label}</span>${count}
     </button>`;
-  }).join('');
+  }
+
+  return `<button class="nav-item" data-sidebar-panel-item data-view="${view.id}" aria-current="${isCurrent ? 'page' : 'false'}" tabindex="${collapsed ? '-1' : '0'}">
+    ${icon(view.icon, 17)}
+    <span>${label}</span>
+    ${count}
+  </button>`;
+}
+
+function renderSidebar() {
+  const collapsed = isSidebarCollapsed();
+  const nav = views.filter((view) => view.id !== 'settings').map((view) => renderSidebarNavItem(view, { collapsed })).join('');
+  const settings = renderSidebarNavItem(views.find((view) => view.id === 'settings'), { collapsed });
+  const railNav = views.map((view) => renderSidebarNavItem(view, { compact: true, collapsed })).join('');
 
   return `<aside class="sidebar">
-      <div class="identity-rail" aria-label="Zoid Bank identity rail"><span class="identity-code">ZB</span><span class="identity-rule"></span><span class="identity-foot">LOCAL</span></div>
-    <div class="sidebar-main">
+      <div class="identity-rail" aria-label="Zoid Bank identity rail">
+        <button class="sidebar-toggle ${collapsed ? 'sidebar-toggle--open' : 'sidebar-toggle--close'}" data-sidebar-toggle type="button" aria-controls="primary-sidebar-navigation" aria-expanded="${!collapsed}" aria-label="${collapsed ? 'Maximize sidebar' : 'Minimize sidebar'}" title="${collapsed ? 'Maximize sidebar' : 'Minimize sidebar'}"><span></span><span></span><span></span></button>
+        <span class="identity-code">ZB</span>
+        <span class="identity-rule"></span>
+        <nav class="sidebar-rail-nav" data-sidebar-rail-nav aria-label="Compact dashboard modes" aria-hidden="${!collapsed}"${collapsed ? '' : ' inert'}>${railNav}</nav>
+        <span class="identity-foot">LOCAL</span>
+      </div>
+    <div class="sidebar-main" id="primary-sidebar-navigation" data-sidebar-panel aria-hidden="${collapsed}"${collapsed ? ' inert' : ''}>
       <div class="brand"><span class="brand-mark">ZB</span><span><span class="brand-name">Zoid Bank</span><small>Private signal ledger</small></span></div>
       <div class="nav-label">Command index</div>
       <nav class="nav-list" aria-label="Dashboard modes">
         ${nav}
       </nav>
       <div class="nav-label">Workspace</div>
-      <button class="nav-item" data-view="settings" aria-current="${state.view === 'settings' ? 'page' : 'false'}">${icon('settings', 17)}<span>Settings</span></button>
+      ${settings}
       <div class="sidebar-spacer"></div>
       <div class="local-card">
         <div class="local-card-head"><span class="status-dot"></span><span>Local boundary</span></div>
@@ -298,22 +718,19 @@ function renderSidebar() {
 
 function renderTopbar() {
   return `<header class="topbar">
-    <div class="breadcrumbs"><span class="topbar-code">CMD ${currentView().key}</span><span>Zoid Bank</span><span class="breadcrumb-slash">/</span><strong>${currentView().label}</strong></div>
-    <div class="topbar-actions">
-      <span class="sync-note"><span class="status-dot"></span>Last local sync 8 min ago</span>
-      <span class="local-badge"><span class="status-dot"></span>${icon('lock', 13)} Local only</span>
-    </div>
+    <div class="breadcrumbs"><span>Zoid Bank</span><span class="breadcrumb-slash">/</span><strong>${currentView().label}</strong></div>
   </header>`;
 }
 
 function renderPageHeading({ eyebrow, title, description, amber = false, action = '' }) {
+  const titleId = state.view === 'cash-flow' ? 'cash-flow-title' : `${state.view}-title`;
   return `<div class="page-heading">
     <div class="page-heading-copy">
-      <div class="route-mast"><span class="route-code">CMD ${currentView().key}</span><p class="eyebrow${amber ? ' amber' : ''}">${eyebrow}</p></div>
-      <h1>${title}</h1>
+      ${eyebrow ? `<p class="eyebrow${amber ? ' amber' : ''}">${eyebrow}</p>` : ''}
+      <h1 id="${titleId}">${title}</h1>
       <p class="heading-description">${description}</p>
     </div>
-    ${action ? `<div class="heading-actions">${action}</div>` : '<div class="mast-proof"><span class="status-dot"></span><strong>Local evidence</strong><small>Source-bound workspace</small></div>'}
+    ${action ? `<div class="heading-actions">${action}</div>` : ''}
   </div>`;
 }
 
@@ -326,49 +743,28 @@ function renderOverview() {
   const reviewCount = live.reviews.length;
   const patterns = detectRecurringPatterns(live.debits);
   const trend = observedTrend(live.debits, state.trendTimeframe);
-  const allocation = [
-    { name: 'Home & utilities', amount: categoryAmount(live.categories, ['home', 'utility']), tone: '' },
-    { name: 'Groceries', amount: categoryAmount(live.categories, ['grocery', 'market']), tone: 'tone-2' },
-    { name: 'Transport', amount: categoryAmount(live.categories, ['transport']), tone: 'tone-3' },
-    { name: 'Eating out', amount: categoryAmount(live.categories, ['eating', 'restaurant']), tone: 'tone-4' }
-  ];
   return `<section class="page" aria-labelledby="overview-title">
     ${renderPageHeading({
-      eyebrow: 'August 2026 · Tuesday, 4 August',
-      title: 'Good morning, Ziad',
-      description: 'A calm read on the money moving through your local workspace.',
-      action: `${addTransactionButton()}<button class="button button-secondary" data-view="transactions">View transactions ${icon('arrowRight', 15)}</button><button class="button button-amber" data-view="review"><span class="status-dot" style="background:#ffe0b0;box-shadow:none"></span>Review ${reviewCount} item${reviewCount === 1 ? '' : 's'}</button>`
+      eyebrow: '',
+      title: 'Overview',
+      description: 'Your approved spending and latest transactions.',
+      action: `${addTransactionButton()}${reviewCount ? `<button class="button button-amber" data-view="review">Review ${reviewCount} item${reviewCount === 1 ? '' : 's'}</button>` : ''}`
     })}
     <div class="overview-hero">
       <article class="card position-card">
         <span class="card-label">Approved spending</span>
-        <div class="position-value">${formatCurrency(live.debitTotal)}</div>
-        <div class="position-meta"><span class="source-chip source-chip-dark">${icon('message', 11)} Bank SMS only</span><span class="muted-inverse">Approved debit messages to date</span></div>
+        <div class="position-value${canDisplayConvertedSpending(live.debitTotal) ? '' : ' position-value-split'}">${approvedSpendingMarkup(live.debits, live.debitTotal)}</div>
+        <div class="position-meta"><span class="source-chip source-chip-dark">${icon('message', 11)} Bank SMS only</span><span class="muted-inverse">${canDisplayConvertedSpending(live.debitTotal) ? 'Approved debit messages to date' : 'Native currency totals shown separately · no estimated conversion'}</span></div>
         <div class="position-footer">
           <div><span class="metric-number">${live.debits.length}</span><span class="muted-inverse">Approved debit SMS</span></div>
-          <div><span class="metric-number">${patterns.length}</span><span class="muted-inverse">Recurring signals</span></div>
         </div>
       </article>
       <article class="card trend-card">
-        <div class="card-header"><div><span class="card-label">Approved spending trend</span><h2>Observed debits over ${trend.label}</h2></div><div class="trend-controls"><label class="trend-range"><span>Range</span><select id="trend-timeframe" aria-label="Trend timeframe">${Object.entries(overviewTrendRanges).map(([value, range]) => `<option value="${value}" ${value === state.trendTimeframe ? 'selected' : ''}>${range.label}</option>`).join('')}</select></label><div class="trend-total">${formatCurrency(trend.total)}<small>Approved debit messages only</small></div></div></div>
+        <div class="card-header"><div><span class="card-label">Approved spending trend</span><h2>Observed debits over ${trend.label}</h2></div><div class="trend-controls">${sumiDropdown({ id: 'trend-timeframe', label: 'Range', value: state.trendTimeframe, options: Object.entries(overviewTrendRanges).map(([value, range]) => ({ value, label: range.label })), className: 'sumi-dropdown--compact' })}<div class="trend-total">${formatCurrency(trend.total)}<small>Approved debit messages only</small></div></div></div>
         <div class="chart-wrap">${overviewTrendChart(trend)}</div>
       </article>
     </div>
-    <div class="overview-secondary">
-      <article class="card allocation-card">
-        <div class="card-header"><div><span class="card-label">Where it went</span><h3>Monthly spending</h3></div><button class="button button-quiet" data-view="cash-flow">View detail ${icon('arrowRight', 13)}</button></div>
-        <div class="allocation-list">
-          ${allocation.map((item) => allocationRow(item.name, formatCurrency(item.amount), live.debitTotal ? Math.round((item.amount / live.debitTotal) * 100) : 0, item.tone)).join('')}
-        </div>
-      </article>
-      <article class="card recurring-card">
-        <div class="card-header"><div><span class="card-label">Pattern signal</span><h3>Recurring payments</h3></div><button class="button button-quiet" data-view="recurring">View recurring ${icon('arrowRight', 13)}</button></div>
-        <div class="signal-box"><span class="signal-icon">${icon(patterns.length ? 'trendUp' : 'message', 18)}</span><div><strong>${patterns.length ? `${patterns.length} observed pattern${patterns.length === 1 ? '' : 's'}` : 'No repeated debits yet'}</strong><span>${patterns.length ? 'Calculated from approved debit evidence only.' : 'A repeated pattern will appear after another approved debit.'}</span></div></div>
-        <div class="recurring-list">${patterns.length ? patterns.slice(0, 3).map((pattern) => `<div class="recurring-row"><span>${escapeHtml(pattern.merchant)}</span><strong>${formatCurrency(pattern.amount, pattern.currency)} · ${pattern.evidenceCount} observed</strong></div>`).join('') : '<div class="recurring-empty-inline">Approved debit events are the only input for automatic observations.</div>'}</div>
-      </article>
-    </div>
     ${renderRecentTransactions()}
-    <div class="note-row"><span>${icon('shield', 14)} Local projection from approved debit messages.</span><span>Manual entries never become recurring evidence.</span></div>
   </section>`;
 }
 
@@ -380,7 +776,7 @@ function renderRecentTransactions() {
   const items = transactionLedger()
     .filter((item) => item.status !== 'Needs review')
     .slice(0, 6);
-  return `<article class="card transactions-card"><div class="card-header"><div><span class="card-label">Activity</span><h3>Recent transactions</h3></div><button class="button button-quiet" data-view="transactions">See all transactions ${icon('arrowRight', 13)}</button></div><div class="transaction-list">${items.length ? items.map((item) => `<div class="transaction-row"><div class="transaction-main"><span class="transaction-icon">${icon(item.icon, 15)}</span><div class="transaction-copy"><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.meta)}</span><span class="transaction-source ${item.sourceType === 'manual' ? 'manual-source' : 'bank-source'}">${item.sourceType === 'manual' ? `Manual · ${manualTypeLabel(item.type)}` : escapeHtml(item.source)}</span></div></div><div class="transaction-amount">${item.sourceType === 'manual' ? manualDisplayAmount(item.type, item.amount) : signedCurrency(item.amount, item.currency, item.direction)}<small>${item.sourceType === 'manual' ? 'Manual entry' : 'Approved debit'}</small></div></div>`).join('') : '<div class="transaction-empty"><strong>No local activity yet</strong><p>Scan approved Messages alerts or add a manual note to begin.</p></div>'}</div></article>`;
+  return `<article class="card transactions-card"><div class="card-header"><div><span class="card-label">Activity</span><h3>Recent transactions</h3></div><button class="button button-quiet" data-view="transactions">See all transactions ${icon('arrowRight', 13)}</button></div><div class="transaction-list">${items.length ? items.map((item) => `<div class="transaction-row"><div class="transaction-main"><span class="transaction-icon">${icon(item.icon, 15)}</span><div class="transaction-copy"><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.meta)}</span></div></div><div class="transaction-amount">${item.sourceType === 'manual' ? manualDisplayAmount(item.type, item.amount) : signedCurrency(item.amount, item.currency, item.direction)}<small>${item.sourceType === 'manual' ? 'Manual entry' : 'Approved debit'}</small></div></div>`).join('') : '<div class="transaction-empty"><strong>No local activity yet</strong><p>Scan approved Messages alerts or add a manual note to begin.</p></div>'}</div></article>`;
 }
 
 function manualIcon(type) {
@@ -411,12 +807,16 @@ function transactionLedger() {
     currency: 'EGP',
     sourceType: 'manual',
     source: `Manual entry · ${manualTypeLabel(item.type)}`,
-    status: 'Manual'
+    status: 'Manual',
+    dateValue: toISODate(item.date),
+    originalMessage: null,
+    preview: null
   }));
   const ledgerSnapshot = harborLedger.snapshot();
   const pendingReviews = ledgerSnapshot.reviewCandidates
     .map((candidate) => ({
       id: candidate.id,
+      sourceId: candidate.sourceId,
       icon: 'alert',
       name: candidate.merchant,
       meta: candidate.date,
@@ -427,7 +827,16 @@ function transactionLedger() {
       direction: candidate.direction || 'debit',
       sourceType: 'bank',
       source: 'Messages · needs review',
-      status: 'Needs review'
+      status: 'Needs review',
+      sender: candidate.sender,
+      senderProfileId: candidate.senderProfileId,
+      senderProfileName: candidate.senderProfileName,
+      parserVersion: candidate.parserVersion,
+      receivedAt: candidate.receivedAt,
+      preview: candidate.preview,
+      originalMessage: candidate.originalMessage,
+      reasons: candidate.reasons,
+      decision: null
     }));
   const automaticallyApproved = ledgerSnapshot.events.map((event) => ({
     id: event.id,
@@ -440,11 +849,18 @@ function transactionLedger() {
     amount: event.direction === 'credit' ? event.amount : -event.amount,
     currency: event.currency || 'EGP',
     direction: event.direction || 'debit',
-    sourceType: 'bank',
-    source: event.source || (event.decision?.mode === 'manual' ? 'Messages · manually approved' : 'Messages · approved'),
-    status: event.status === 'approved' ? 'Approved' : 'Auto-approved'
+      sourceType: 'bank',
+      source: event.source || (event.decision?.mode === 'manual' ? 'Messages · manually approved' : 'Messages · approved'),
+      status: event.status === 'approved' ? 'Approved' : 'Auto-approved',
+      senderProfileId: event.senderProfileId,
+      senderProfileName: event.senderProfileName,
+      parserVersion: event.parserVersion,
+      receivedAt: event.receivedAt,
+      preview: event.preview,
+      originalMessage: event.originalMessage,
+      decision: event.decision
   }));
-  return [...manual, ...pendingReviews, ...automaticallyApproved];
+  return sortTransactionRecords([...manual, ...pendingReviews, ...automaticallyApproved]);
 }
 
 function ledgerAmount(item) {
@@ -459,39 +875,58 @@ function transactionRowMatches(item) {
     || (state.transactionFilter === 'bank' && item.sourceType === 'bank')
     || (state.transactionFilter === 'manual' && item.sourceType === 'manual')
     || (state.transactionFilter === 'review' && item.status === 'Needs review');
-  return matchesQuery && matchesFilter;
+  const matchesCategory = state.transactionCategory === 'all'
+    || (item.category || 'Other') === state.transactionCategory;
+  return matchesQuery && matchesFilter && matchesCategory;
+}
+
+function transactionCategorySelect(ledger) {
+  const categories = [...new Set(ledger.map((item) => item.category || 'Other'))]
+    .sort((left, right) => left.localeCompare(right));
+  return `<div class="transaction-category-control">${sumiDropdown({
+    id: 'transaction-category',
+    label: 'Category',
+    value: state.transactionCategory,
+    options: [{ value: 'all', label: 'All categories' }, ...categories.map((category) => ({ value: category, label: category }))],
+    inputAttributes: 'data-transaction-category'
+  })}</div>`;
 }
 
 function renderTransactions() {
   const ledger = transactionLedger();
   const visible = ledger.filter(transactionRowMatches);
+  const pageCount = Math.max(1, Math.ceil(visible.length / TRANSACTIONS_PER_PAGE));
+  const currentPage = Math.min(state.transactionPage, pageCount);
+  state.transactionPage = currentPage;
+  const pageStart = (currentPage - 1) * TRANSACTIONS_PER_PAGE;
+  const pageItems = visible.slice(pageStart, pageStart + TRANSACTIONS_PER_PAGE);
+  const rangeStart = visible.length ? pageStart + 1 : 0;
+  const rangeEnd = Math.min(pageStart + TRANSACTIONS_PER_PAGE, visible.length);
   const bankCount = ledger.filter((item) => item.sourceType === 'bank').length;
   const manualCount = ledger.filter((item) => item.sourceType === 'manual').length;
   const reviewCount = ledger.filter((item) => item.status === 'Needs review').length;
   return `<section class="page" aria-labelledby="transactions-title">
     ${renderPageHeading({
-      eyebrow: 'Ledger · August 2026',
-      title: 'Transactions, in one place',
-      description: 'A searchable record of structured events, with the source and decision state kept visible.',
-      action: `${addTransactionButton()}<button class="button button-secondary" data-action="export-transactions">Export view ${icon('arrowRight', 15)}</button>`
+      eyebrow: '',
+      title: 'Transactions',
+      description: 'Search, filter, and manage your local transaction record.',
+      action: `${addTransactionButton()}<button class="button button-secondary" data-action="export-transactions"${visible.length ? '' : ' disabled aria-disabled="true"'}>Export view ${icon('arrowRight', 15)}</button>`
     })}
-    <div class="transactions-summary-grid" aria-label="Transaction summary">
-      <article class="card transaction-summary-card"><span class="card-label">Total records</span><strong>${ledger.length}</strong><span>All local entries in this ledger</span></article>
-      <article class="card transaction-summary-card transaction-summary-card-accent"><span class="card-label">Needs your review</span><strong>${reviewCount}</strong><span>Uncertain bank SMS parsing</span></article>
-      <article class="card transaction-summary-card"><span class="card-label">Source split</span><strong>${bankCount} / ${manualCount}</strong><span>Approved Messages / manual notes</span></article>
-    </div>
     <div class="transactions-toolbar card"><div class="transaction-filter-group" role="group" aria-label="Transaction filters">
       ${transactionFilterButton('all', 'All activity', ledger.length)}
       ${transactionFilterButton('bank', 'Bank SMS', bankCount)}
       ${transactionFilterButton('manual', 'Manual', manualCount)}
       ${transactionFilterButton('review', 'Needs review', reviewCount)}
-    </div><div class="transaction-toolbar-controls">${currencySelect('transaction-currency')}<label class="transaction-search">${icon('search', 15)}<span class="sr-only">Search transactions</span><input id="transaction-search" type="search" placeholder="Search merchant, category, or source" value="${state.transactionQuery.replace(/"/g, '&quot;')}" /></label></div></div>
-    <div class="transactions-page-grid"><article class="card transaction-table-card"><div class="card-header"><div><span class="card-label">Local ledger</span><h2>All activity</h2></div><span class="card-note">Showing ${visible.length} of ${ledger.length}</span></div><div class="transaction-table-scroll"><div class="ledger-table" role="table" aria-label="Transactions">
+    </div><div class="transaction-toolbar-controls">${transactionCategorySelect(ledger)}${currencySelect('transaction-currency')}<label class="transaction-search">${icon('search', 15)}<span class="sr-only">Search transactions</span><input id="transaction-search" type="search" placeholder="Search merchant, category, or source" value="${state.transactionQuery.replace(/"/g, '&quot;')}" /></label></div></div>
+    <div class="transactions-page-grid"><article class="card transaction-table-card"><div class="card-header"><div><span class="card-label">Local ledger</span><h2>All activity</h2></div><span class="card-note">Showing ${rangeStart}-${rangeEnd} of ${visible.length}${visible.length !== ledger.length ? ` matching · ${ledger.length} total` : ''}</span></div><div class="transaction-table-scroll"><div class="ledger-table" role="table" aria-label="Transactions">
       <div class="ledger-table-head" role="row"><span role="columnheader">Merchant</span><span role="columnheader">Category</span><span role="columnheader">Source</span><span role="columnheader">Date</span><span role="columnheader">Amount</span></div>
-      ${visible.length ? visible.map(transactionLedgerRow).join('') : `<div class="transaction-empty"><span>${icon('search', 20)}</span><strong>No matching entries</strong><p>Try a different search or filter.</p></div>`}
-    </div></div></article></div>
-    <div class="note-row"><span>${icon('shield', 14)} Local Messages data stays on this Mac Mini.</span><span>Manual entries never change approved bank SMS totals.</span></div>
+      ${pageItems.length ? pageItems.map(transactionLedgerRow).join('') : `<div class="transaction-empty"><span>${icon('search', 20)}</span><strong>No matching entries</strong><p>Try a different search or filter.</p></div>`}
+    </div></div>${visible.length > TRANSACTIONS_PER_PAGE ? renderTransactionPagination(currentPage, pageCount) : ''}</article></div>
   </section>`;
+}
+
+function renderTransactionPagination(currentPage, pageCount) {
+  return `<nav class="transaction-pagination" aria-label="Transactions pagination"><button class="pagination-button" type="button" data-transaction-page="${currentPage - 1}" ${currentPage === 1 ? 'disabled' : ''}>${icon('arrowLeft', 13)} Previous</button><span class="pagination-status" aria-live="polite">Page <strong>${currentPage}</strong> of ${pageCount}</span><button class="pagination-button" type="button" data-transaction-page="${currentPage + 1}" ${currentPage === pageCount ? 'disabled' : ''}>Next ${icon('arrowRight', 13)}</button></nav>`;
 }
 
 function transactionFilterButton(id, label, count) {
@@ -507,7 +942,132 @@ function transactionLedgerRow(item) {
   const recurringAction = canCreateRule
     ? `<button class="ledger-row-action" type="button" data-action="open-recurring-rule" data-transaction-id="${escapeHtml(item.id)}">${hasRule ? 'Manage recurring' : 'Make recurring'}</button>`
     : '';
-  return `<div class="ledger-table-row" role="row"><span class="ledger-merchant"><span class="transaction-icon">${icon(item.icon, 15)}</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.category)}</small></span></span><span class="ledger-category">${escapeHtml(item.category)}</span><span class="ledger-source ${sourceClass}">${escapeHtml(item.source)}</span><span class="ledger-date">${escapeHtml(item.meta)}</span><span class="ledger-amount ${item.amount >= 0 ? 'ledger-amount-positive' : ''}">${ledgerAmount(item)}<small class="${statusClass}">${escapeHtml(item.status)}</small>${recurringAction}</span></div>`;
+  const detailLabel = `View details for ${item.name}`;
+  return `<div class="ledger-table-row" role="row"><span class="ledger-merchant"><span class="transaction-icon">${icon(item.icon, 15)}</span><a class="ledger-detail-link" href="${transactionDetailUrl(item.id)}" aria-label="${escapeHtml(detailLabel)}"><strong>${escapeHtml(item.name)}</strong><span>View details ${icon('arrowRight', 12)}</span></a></span><span class="ledger-category">${escapeHtml(item.category)}</span><span class="ledger-source ${sourceClass}">${escapeHtml(item.source)}</span><span class="ledger-date">${escapeHtml(item.meta)}</span><span class="ledger-amount ${item.amount >= 0 ? 'ledger-amount-positive' : ''}">${ledgerAmount(item)}<small class="${statusClass}">${escapeHtml(item.status)}</small>${recurringAction}</span></div>`;
+}
+
+function detailTimestamp(value, fallback = 'Not available') {
+  const date = new Date(value || '');
+  if (Number.isNaN(date.getTime())) return fallback;
+  return date.toLocaleString('en-GB', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit'
+  });
+}
+
+function transactionDirectionLabel(item) {
+  if (item.sourceType === 'manual') return manualTypeLabel(item.type);
+  return item.direction === 'credit' ? 'Credit' : 'Debit';
+}
+
+function transactionDecisionLabel(item) {
+  if (item.sourceType === 'manual') return 'Entered manually';
+  if (item.status === 'Needs review') return 'Waiting for review';
+  return item.decision?.mode === 'manual' ? 'Approved after review' : 'Automatically approved';
+}
+
+function transactionDetailFacts(item) {
+  const facts = [
+    ['Category', item.category || 'Not available'],
+    ['Direction', transactionDirectionLabel(item)],
+    ['Ledger date', item.meta || 'Not available'],
+    ['Source', item.source || 'Not available']
+  ];
+  if (item.sourceType === 'bank') {
+    facts.push(['Bank profile', item.senderProfileName || 'Not available']);
+    facts.push(['Parser', item.parserVersion || 'Not available']);
+    facts.push(['Captured', detailTimestamp(item.receivedAt)]);
+  }
+  return facts.map(([label, value]) => `<div class="transaction-detail-fact"><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join('');
+}
+
+function renderTransactionDetailAction(item) {
+  const isDebit = item.direction === 'debit' || (!item.direction && item.amount < 0);
+  const canCreateRule = item.sourceType === 'bank' && isDebit && item.status !== 'Needs review';
+  if (canCreateRule) {
+    const hasRule = state.manualRecurringRules.some((rule) => rule.sourceEventId === item.id);
+    return `<button class="button button-primary" data-action="open-recurring-rule" data-transaction-id="${escapeHtml(item.id)}">${hasRule ? 'Manage recurring' : 'Make recurring'} ${icon('recurring', 14)}</button>`;
+  }
+  if (item.status === 'Needs review') {
+    return '<button class="button button-amber" data-view="review">Open review queue</button>';
+  }
+  return '';
+}
+
+function renderTransactionDetail() {
+  const item = transactionLedger().find((transaction) => transaction.id === state.transactionDetailId);
+  if (!item) {
+    return `<section class="page transaction-detail-page" aria-labelledby="transaction-title">
+      ${renderPageHeading({
+        eyebrow: 'Transaction record',
+        title: 'Transaction not found',
+        description: 'This local record is no longer available. It may have been cleared from this browser.',
+        action: '<a class="button button-secondary" href="?variant=transactions">Back to transactions</a>'
+      })}
+    </section>`;
+  }
+  const message = item.originalMessage || item.preview || '';
+  const hasOriginalMessage = Boolean(item.originalMessage);
+  const sourceMessage = item.sourceType === 'manual'
+    ? {
+        title: 'No original message',
+        description: 'This is a manual entry, so it is intentionally kept separate from imported bank messages.',
+        body: 'Manual transaction - no bank message attached.'
+      }
+    : hasOriginalMessage
+      ? {
+          title: 'Original bank message',
+          description: 'Stored locally with this transaction. It is not sent to a cloud service.',
+          body: message
+        }
+      : {
+          title: 'Original message unavailable',
+          description: 'This record was captured before full message retention. Its locally stored redacted preview is shown instead.',
+          body: message || 'No local message preview is available for this record.'
+        };
+  const decisionDetail = item.status === 'Needs review'
+    ? (item.reasons?.length ? item.reasons.join(' · ') : 'A human review is required before this message becomes a transaction.')
+    : item.sourceType === 'manual'
+      ? 'This manual entry never changes imported bank-message evidence.'
+      : item.decision?.reason || 'This entry is part of the local ledger.';
+  return `<section class="page transaction-detail-page" aria-labelledby="transaction-title">
+    ${renderPageHeading({
+      eyebrow: 'Transaction record',
+      title: escapeHtml(item.name),
+      description: 'A complete local record of this transaction and the message that created it.',
+      action: `<a class="button button-secondary" href="?variant=transactions">${icon('arrowLeft', 14)} Back to transactions</a>`
+    })}
+    <div class="transaction-detail-summary">
+      <article class="card transaction-detail-amount-card">
+        <span class="card-label">Recorded amount</span>
+        <strong class="transaction-detail-amount ${item.amount >= 0 ? 'ledger-amount-positive' : ''}">${ledgerAmount(item)}</strong>
+        <span class="transaction-detail-status">${escapeHtml(item.status)}</span>
+      </article>
+      <article class="card transaction-detail-decision-card">
+        <span class="card-label">Ledger decision</span>
+        <strong>${escapeHtml(transactionDecisionLabel(item))}</strong>
+        <p>${escapeHtml(decisionDetail)}</p>
+      </article>
+    </div>
+    <div class="transaction-detail-grid">
+      <article class="card transaction-detail-card">
+        <div class="card-header"><div><span class="card-label">Transaction fields</span><h2>Recorded details</h2></div></div>
+        <dl class="transaction-detail-facts">${transactionDetailFacts(item)}</dl>
+      </article>
+      <article class="card transaction-detail-card transaction-detail-actions-card">
+        <div class="card-header"><div><span class="card-label">Local controls</span><h2>Available actions</h2></div></div>
+        <p>${item.sourceType === 'bank' ? 'Recurring rules are local reminders only. They never create a payment or modify bank evidence.' : 'Manual transactions remain separate from imported bank messages.'}</p>
+        <div class="transaction-detail-actions">${renderTransactionDetailAction(item) || '<span class="transaction-detail-disabled">No extra action is available for this record.</span>'}</div>
+      </article>
+      <article class="card transaction-source-message-card">
+        <div class="transaction-source-message-header"><div><span class="card-label">Message evidence</span><h2>${sourceMessage.title}</h2><p>${sourceMessage.description}</p></div><span class="transaction-source-message-local">${icon('lock', 13)} LOCAL ONLY</span></div>
+        <pre class="transaction-source-message" dir="auto">${escapeHtml(sourceMessage.body)}</pre>
+      </article>
+    </div>
+  </section>`;
 }
 
 function overviewTrendChart(trend) {
@@ -530,78 +1090,23 @@ function overviewTrendChart(trend) {
 
 function renderRecurring() {
   const live = liveLedgerSummary();
-  const patterns = detectRecurringPatterns(live.debits, { asOf: new Date() });
+  const detectedPatterns = detectRecurringPatterns(live.debits, { asOf: new Date() });
+  const patterns = detectedPatterns.filter((pattern) => !state.dismissedRecurringPatternIds.includes(pattern.id));
   const manualRules = state.manualRecurringRules;
-  const statusCounts = patterns.reduce((counts, pattern) => {
-    counts[pattern.status] = (counts[pattern.status] || 0) + 1;
-    return counts;
-  }, {});
-  const confirmedPatterns = patterns.filter((pattern) => pattern.status === 'confirmed');
-  const confirmedTypicalAmount = confirmedPatterns.reduce((sum, pattern) => sum + pattern.amount, 0);
-  const upcoming = patterns
-    .filter((pattern) => pattern.nextObservedDate && pattern.status !== 'paused')
-    .sort((a, b) => a.nextObservedDate.localeCompare(b.nextObservedDate));
-  const cadenceNames = [...new Set(patterns.map((pattern) => pattern.cadence))];
-  const cadenceDays = patterns.map((pattern) => pattern.cadenceDays).filter(Number.isFinite);
-  const cadenceRange = cadenceDays.length
-    ? `${Math.min(...cadenceDays)}–${Math.max(...cadenceDays)} days`
-    : 'No measured interval';
-  const cadenceSummary = cadenceNames.length === 1 ? `${cadenceNames[0]} rhythm` : cadenceNames.length ? 'Mixed observed rhythms' : 'No cadence measured';
+  const recurringEmptyState = detectedPatterns.length && !patterns.length
+    ? '<div class="recurring-empty-state"><strong>No active recurring patterns</strong><p>The detected patterns you removed are hidden. Your approved transactions remain unchanged.</p></div>'
+    : '<div class="recurring-empty-state"><strong>No recurring patterns yet</strong><p>A pattern appears after two approved debits from the same merchant.</p></div>';
 
   return `<section class="page recurring-page" aria-labelledby="recurring-title">
-    ${renderPageHeading({
-      eyebrow: 'Patterns · local projection',
-      title: 'Recurring, without false certainty',
-      description: 'See what repeats in approved debit evidence, what changed, and what you have chosen to track manually.',
-      action: `<button class="button button-secondary" data-view="transactions">Open transactions ${icon('arrowRight', 15)}</button><button class="button button-amber" data-view="review">${icon('alert', 14)}Review ${live.reviews.length} item${live.reviews.length === 1 ? '' : 's'}</button>`
-    })}
-    <div class="recurring-summary-grid">
-      <article class="card recurring-commitment-card">
-        <div class="recurring-summary-head"><span class="card-label">Confirmed observed amount</span><span class="recurring-summary-source">${confirmedPatterns.length} pattern${confirmedPatterns.length === 1 ? '' : 's'}</span></div>
-        <strong class="recurring-total">${formatCurrency(confirmedTypicalAmount)}</strong>
-        <p>Typical amounts for confirmed repeated groups. This is not a scheduled payment total.</p>
-        <div class="recurring-commitment-footer"><span>${icon('message', 13)}${live.debits.length} approved debit${live.debits.length === 1 ? '' : 's'}</span><span>${icon('lock', 13)}Local only</span></div>
-      </article>
-      <article class="card recurring-signal-card">
-        <div class="card-header"><div><span class="card-label">Pattern read</span><h2>${patterns.length} observed pattern${patterns.length === 1 ? '' : 's'}</h2></div>${icon('bolt', 18)}</div>
-        <p class="recurring-signal-description">Automatic groups need at least two dated approved debit events. Amount tolerance and date spacing are calculated locally for each merchant.</p>
-        <div class="recurring-signal-metrics"><div><strong>${statusCounts.confirmed || 0}</strong><span>Confirmed</span></div><div><strong>${statusCounts.signal || 0}</strong><span>Signal</span></div><div><strong>${statusCounts.changed || 0}</strong><span>Changed</span></div><div><strong>${statusCounts.paused || 0}</strong><span>Paused</span></div></div>
-        <div class="recurring-signal-callout">${icon('alert', 14)}<span>Observed patterns never schedule or pay anything automatically.</span></div>
-      </article>
-    </div>
-    <div class="recurring-board-grid">
-      <article class="card recurring-patterns-card">
-        <div class="card-header"><div><span class="card-label">Automatic observations</span><h2>What repeats</h2></div><span class="card-note">Approved debit events only</span></div>
-        <div class="recurring-legend"><span><i class="recurring-legend-dot confirmed"></i>Confirmed</span><span><i class="recurring-legend-dot signal"></i>Signal</span><span><i class="recurring-legend-dot changed"></i>Changed</span><span><i class="recurring-legend-dot paused"></i>Paused</span></div>
+    <div class="page-heading recurring-page-heading"><div class="page-heading-copy"><h1 id="recurring-title">Repeated transactions</h1><p class="heading-description">Patterns found in your approved debit transactions.</p></div><div class="heading-actions"><button class="button button-primary" data-view="transactions">Manage in transactions ${icon('arrowRight', 15)}</button></div></div>
+    <article class="card recurring-patterns-card">
+        <div class="card-header"><div><h2>${patterns.length} pattern${patterns.length === 1 ? '' : 's'}</h2></div><span class="card-note">Approved debits only</span></div>
         <div class="recurring-pattern-table" role="table" aria-label="Recurring patterns">
-          <div class="recurring-pattern-head" role="row"><span>Pattern</span><span>Cadence</span><span>Next observation</span><span>Amount</span></div>
-          ${patterns.length ? patterns.map(recurringPatternRow).join('') : `<div class="recurring-empty-state"><span class="recurring-empty-icon">${icon('message', 20)}</span><strong>No repeated approved debits yet</strong><p>Automatic observations will appear after the same merchant has at least two dated debit events in the local Messages ledger.</p><button class="button button-secondary" data-view="transactions">Open transactions ${icon('arrowRight', 14)}</button></div>`}
+          <div class="recurring-pattern-head" role="row"><span>Transaction</span><span>Status</span><span>Next expected</span><span>Typical amount</span><span>Action</span></div>
+          ${patterns.length ? patterns.map(recurringPatternRow).join('') : recurringEmptyState}
         </div>
-      </article>
-      <article class="card upcoming-card">
-        <div class="card-header"><div><span class="card-label">Observed windows</span><h2>Next pattern checks</h2></div><span class="card-note">No payment action</span></div>
-        <p class="upcoming-description">These dates are calculated observation windows, not due dates or scheduled payments.</p>
-        <div class="upcoming-list">
-          ${upcoming.length ? upcoming.map((pattern) => upcomingCommitment(pattern.nextObservedDate, pattern.merchant, `${pattern.cadence} · ${pattern.statusLabel.toLowerCase()}`, pattern.amount, pattern.currency, pattern.status)).join('') : '<div class="recurring-empty-state compact"><strong>No next observation window</strong><p>A stable dated cadence will create one here.</p></div>'}
-        </div>
-        <div class="upcoming-total"><div><span>Confirmed typical amount</span><strong>${formatCurrency(confirmedTypicalAmount)}</strong></div><div><span>Manual rules kept separate</span><strong>${manualRules.length}</strong></div></div>
-      </article>
-    </div>
-    ${renderManualRecurringRules(manualRules)}
-    <div class="recurring-bottom-grid">
-      <article class="card cadence-card">
-        <div class="card-header"><div><span class="card-label">Cadence</span><h3>How the rhythm was grouped</h3></div>${icon('calendar', 17)}</div>
-        <div class="cadence-summary"><strong>${cadenceSummary}</strong><span>${patterns.length ? `Measured from ${patterns.length} automatic pattern${patterns.length === 1 ? '' : 's'}.` : 'No automatic cadence is measurable yet.'}</span></div>
-        <div class="cadence-rows"><div class="cadence-row"><span>Observed patterns</span><strong>${patterns.length}</strong><small>${statusCounts.confirmed || 0} confirmed · ${statusCounts.signal || 0} signal · ${statusCounts.changed || 0} changed · ${statusCounts.paused || 0} paused</small></div><div class="cadence-row"><span>Interval range</span><strong>${cadenceRange}</strong><small>Calculated from approved debit dates</small></div></div>
-        <p class="cadence-note">Cadence is an observation, not a calendar entry or a bank promise.</p>
-      </article>
-      <article class="card recurring-boundary-card">
-        <div class="card-header"><div><span class="card-label">Source boundary</span><h3>Local-only evidence</h3></div>${icon('lock', 17)}</div>
-        <div class="boundary-callout"><span class="boundary-icon">${icon('message', 16)}</span><div><strong>${live.debits.length} approved debit message${live.debits.length === 1 ? '' : 's'}</strong><span>Only source for automatic patterns</span></div></div>
-        <div class="boundary-points"><div><span class="boundary-point-icon included">${icon('check', 12)}</span><p>Approved debit events from local Messages can support an observation.</p></div><div><span class="boundary-point-icon separate">${icon('edit', 12)}</span><p>Manual entries and manual rules never change bank evidence.</p></div><div><span class="boundary-point-icon unavailable">${icon('alert', 12)}</span><p>No cloud sync, raw-message rendering, or payment execution exists here.</p></div></div>
-      </article>
-    </div>
-    <div class="note-row"><span>${icon('shield', 14)}Source: local approved Messages ledger.</span><span>Manual rules are reminders only and never execute payments.</span></div>
+    </article>
+    ${manualRules.length ? renderManualRecurringRules(manualRules) : ''}
   </section>`;
 }
 
@@ -613,7 +1118,8 @@ function recurringStatusBadge(status) {
 
 function recurringPatternRow(item) {
   const next = item.nextObservedDate ? formatProjectionDate(item.nextObservedDate) : 'No recent window';
-  return `<div class="recurring-pattern-row ${item.status}" role="row"><div class="recurring-pattern-name"><span class="recurring-pattern-icon">${icon(recurringIconForCategory(item.category), 15)}</span><span><strong>${escapeHtml(item.merchant)}</strong><small>${escapeHtml(item.category)} · ${item.evidenceCount} approved debit${item.evidenceCount === 1 ? '' : 's'}</small><span class="recurring-pattern-note">${recurringStatusBadge(item.status)}${escapeHtml(item.note)}</span></span></div><div class="recurring-cadence"><strong>${escapeHtml(item.cadence)}</strong><small>${escapeHtml(item.rhythm)}</small></div><div class="recurring-next"><strong>${escapeHtml(next)}</strong><small>${item.status === 'paused' ? 'No recent window' : 'Next observation'}</small></div><div class="recurring-amount"><strong>-${formatCurrency(item.amount, item.currency)}</strong><small>${item.status === 'changed' ? `Latest ${formatCurrency(item.latestAmount, item.currency)}` : 'Typical amount'}</small></div></div>`;
+  const actionLabel = `Remove ${item.merchant} recurring pattern`;
+  return `<div class="recurring-pattern-row ${item.status}" role="row"><div class="recurring-pattern-name"><span class="recurring-pattern-icon">${icon(recurringIconForCategory(item.category), 15)}</span><span><strong>${escapeHtml(item.merchant)}</strong><small>${escapeHtml(item.cadence)} · ${item.evidenceCount} transactions</small></span></div><div>${recurringStatusBadge(item.status)}</div><div class="recurring-next"><strong>${escapeHtml(next)}</strong></div><div class="recurring-amount"><strong>-${formatCurrency(item.amount, item.currency)}</strong>${item.status === 'changed' ? `<small>Latest ${formatCurrency(item.latestAmount, item.currency)}</small>` : ''}</div><div class="recurring-pattern-actions"><button class="recurring-pattern-dismiss" type="button" data-action="dismiss-recurring-pattern" data-pattern-id="${escapeHtml(item.id)}" aria-label="${escapeHtml(actionLabel)}" title="${escapeHtml(actionLabel)}">${icon('close', 15)}</button></div></div>`;
 }
 
 function upcomingCommitment(date, name, meta, amount, currency, status) {
@@ -635,38 +1141,26 @@ function renderManualRecurringRules(rules) {
 
 function renderCashFlow() {
   const live = liveLedgerSummary();
-  const recurringPatterns = detectRecurringPatterns(live.debits, { asOf: new Date() });
-  const categories = categoryBreakdown(live.categories, live.debitTotal);
+  const categoryTotal = Object.values(live.categories).reduce((sum, amount) => sum + amount, 0);
+  const categories = categoryBreakdown(live.categories, categoryTotal);
+  const debitScopeNote = live.debitTotal === null ? 'Converted currencies only' : 'Approved debits';
   return `<section class="page" aria-labelledby="cash-flow-title">
     ${renderPageHeading({
-      eyebrow: 'Movement · August 2026',
-      title: 'Spending flow, in plain view',
-      description: 'See the debit activity that your approved bank SMS messages actually support.',
-      action: `${addTransactionButton()}<div class="cashflow-toolbar" role="group" aria-label="Spending period"><button class="segmented-button active">August</button><button class="segmented-button">July</button><button class="segmented-button">3 months</button></div>`
+      eyebrow: '',
+      title: 'Cash flow',
+      description: 'Approved money moving in and out by day.',
+      action: addTransactionButton()
     })}
-    <div class="metrics-grid">
-      ${metricCard('Approved debits', formatCurrency(live.debitTotal), `${live.debits.length} bank SMS approvals`, 'neutral')}
-      ${metricCard('Incoming money', live.credits.length ? formatCurrency(live.creditTotal) : 'Unavailable', live.credits.length ? `${live.credits.length} approved credit messages` : 'No approved credit messages', 'neutral')}
-      ${metricCard('Manual entries', String(state.manualTransactions.length), 'Separate from SMS totals', 'neutral')}
-      ${metricCard('Recurring signals', String(recurringPatterns.length), 'Observed from approved debits', 'neutral')}
+    <div class="metrics-grid distilled-metrics-grid">
+      ${metricCard('Approved debits', approvedSpendingText(live.debits, live.debitTotal), `${live.debits.length} bank SMS approvals`, 'neutral')}
+      ${metricCard('Incoming money', live.credits.length ? approvedSpendingText(live.credits, live.creditTotal) : 'Unavailable', live.credits.length ? `${live.credits.length} approved credit messages` : 'No approved credit messages', 'neutral')}
     </div>
     <div class="cashflow-grid">
-      <article class="card cashflow-chart-card"><div class="card-header"><div><span class="card-label">Approved debit activity</span><h2>Observed spending by day</h2></div><span class="card-note">Debit messages only</span></div><div class="cashflow-chart">${cashFlowBarChart(live.debits)}</div><div class="legend"><span><i></i>Approved debits</span></div></article>
-      <article class="card changes-card"><div class="card-header"><div><span class="card-label">Source limits</span><h3>What this view can say</h3></div>${icon('shield', 17)}</div><div class="changes-list">
-        <div class="change-item"><span class="change-marker">${icon('alert', 14)}</span><div><strong>Incoming money unavailable</strong><p>No approved bank SMS explicitly indicates a credit, so Zoid Bank does not estimate income or a balance.</p></div></div>
-        <div class="change-item"><span class="change-marker">${icon('message', 14)}</span><div><strong>Spending totals are source-bound</strong><p>Only messages that clearly describe a debit are included in approved spending.</p></div></div>
-        <div class="change-item"><span class="change-marker">${icon('edit', 14)}</span><div><strong>Manual entries stay separate</strong><p>Use Add transaction for income, expense, cash, transfer, or adjustment notes.</p></div></div>
-      </div></article>
-    </div>
-    <div class="cashflow-lower">
-      <article class="card forecast-card"><div class="card-header"><div><span class="card-label">Observed pattern</span><h3>Recurring debit signals</h3></div><span class="card-note">Not a forecast</span></div><div class="forecast-list">
-        ${recurringPatterns.length ? recurringPatterns.map((pattern) => forecastRow('SEEN', pattern.merchant, `${pattern.evidenceCount} approved debit${pattern.evidenceCount === 1 ? '' : 's'} · ${pattern.statusLabel.toLowerCase()}`, pattern.amount, pattern.currency)).join('') : '<div class="transaction-empty"><strong>No repeated debit pattern</strong><p>Another approved debit from the same merchant is needed.</p></div>'}
-      </div></article>
-      <article class="card category-table-card"><div class="card-header"><div><span class="card-label">Approved debit mix</span><h3>By category</h3></div><span class="card-note">Month to date</span></div><div class="category-table">
+      <article class="card cashflow-chart-card"><div class="card-header"><div><h2>Spending by day</h2></div><span class="card-note">${debitScopeNote}</span></div><div class="cashflow-chart">${cashFlowBarChart(live.debits)}</div></article>
+      <article class="card category-table-card"><div class="card-header"><div><h2>Spending by category</h2></div>${live.debitTotal === null ? '<span class="card-note">Converted currencies only</span>' : ''}</div><div class="category-table">
         ${categories.length ? categories.map((category) => tableRow(category.name, formatCurrency(category.amount), `${category.share.toFixed(1)}%`)).join('') : '<div class="transaction-empty"><strong>No approved debit categories</strong><p>Categories appear after a debit is approved locally.</p></div>'}
       </div></article>
     </div>
-    <div class="note-row"><span>${icon('shield', 14)} Source: approved debit messages.</span><span>Incoming money is unavailable until an approved credit message exists.</span></div>
   </section>`;
 }
 
@@ -677,68 +1171,35 @@ function metricCard(label, value, trend, trendTone) {
 function renderAnalytics() {
   const live = liveLedgerSummary();
   const largest = Object.entries(live.categories).sort((a, b) => b[1] - a[1])[0] || ['No category', 0];
-  const largestShare = live.debitTotal ? ((largest[1] / live.debitTotal) * 100).toFixed(1) : '0.0';
+  const categoryTotal = Object.values(live.categories).reduce((sum, amount) => sum + amount, 0);
+  const largestShare = categoryTotal ? ((largest[1] / categoryTotal) * 100).toFixed(1) : '0.0';
   const trend = observedTrend(live.debits, 4);
-  const categories = categoryBreakdown(live.categories, live.debitTotal);
-  const dailySeries = recentDebitSeries(live.debits);
-  const dailyPeak = dailySeries.slice().sort((left, right) => right.total - left.total)[0];
+  const categories = categoryBreakdown(live.categories, categoryTotal);
+  const debitScopeNote = live.debitTotal === null ? 'Converted currencies only' : 'Approved debits';
   return `<section class="page analytics-page" aria-labelledby="analytics-title">
     ${renderPageHeading({
-      eyebrow: 'Analytics · August 2026',
-      title: 'See the shape of your spending',
-      description: 'A calm read on cash flow, category mix, and daily rhythm - built from the approved debit sample.',
-      action: `<span class="analytics-range">August 2026 sample</span><button class="button button-secondary" data-view="cash-flow">Open cash flow ${icon('arrowRight', 14)}</button>`
+      eyebrow: '',
+      title: 'Analytics',
+      description: 'Spending trend and category distribution from approved debits.',
+      action: `<button class="button button-secondary" data-view="cash-flow">Open cash flow ${icon('arrowRight', 14)}</button>`
     })}
-    <div class="analytics-scope-banner" role="note">
-      <div class="analytics-scope-copy"><span class="analytics-scope-icon">${icon('shield', 16)}</span><div><strong>Live local boundary</strong><span>${live.debits.length} approved debit messages · ${formatCurrency(live.debitTotal)} observed</span></div></div>
-      <span class="analytics-scope-badge"><span class="status-dot"></span>No live account connection</span>
-    </div>
-    <div class="analytics-metrics">
-      ${analyticsMetric('Approved debit spend', formatCurrency(live.debitTotal), `${live.debits.length} approved messages`, 'moss')}
-      ${analyticsMetric('Largest category', `${largestShare}%`, largest[0], 'sage')}
-      ${analyticsMetric('Approved credits', live.credits.length ? formatCurrency(live.creditTotal) : 'Unavailable', live.credits.length ? `${live.credits.length} messages` : 'No credit messages', 'ochre')}
-      ${analyticsMetric('Open review items', String(live.reviews.length), 'Held outside totals', 'neutral')}
+    <div class="analytics-metrics distilled-metrics-grid">
+      ${analyticsMetric('Approved debit spend', approvedSpendingText(live.debits, live.debitTotal), `${live.debits.length} approved messages`, 'moss')}
+      ${analyticsMetric('Largest category', `${largestShare}%`, live.debitTotal === null ? `${largest[0]} · converted currencies only` : largest[0], 'sage')}
     </div>
     <div class="analytics-top-grid">
       <article class="card analytics-trend-card">
-        <div class="card-header"><div><span class="card-label">Cash flow trend</span><h2>Observed local debit activity</h2></div><span class="card-note">Approved debits only</span></div>
+        <div class="card-header"><div><h2>Spending trend</h2></div><span class="card-note">${debitScopeNote}</span></div>
         <div class="analytics-chart-wrap">${analyticsTrendChart(trend)}</div>
-        <div class="analytics-chart-footer"><span class="analytics-legend"><i class="analytics-legend-current"></i>${trend.label} local ledger window</span><span class="analytics-delta">${formatCurrency(trend.total)} observed</span></div>
+        <div class="analytics-chart-footer"><span>${trend.label}</span><span class="analytics-delta">${formatCurrency(trend.total)}</span></div>
       </article>
-      <article class="card analytics-comparison-card">
-        <div class="card-header"><div><span class="card-label">Source coverage</span><h3>What this ledger currently supports</h3></div>${icon('message', 17)}</div>
-        <p class="comparison-kicker">Only approved local debit messages contribute to these figures.</p>
-        <div class="comparison-list">
-          ${comparisonRow('Current local ledger', formatCurrency(live.debitTotal), 100, 'current')}
-          ${comparisonRow('Categorised debit evidence', `${categories.length} categories`, live.debits.length ? 100 : 0, 'prior')}
-        </div>
-        <div class="comparison-callout"><span class="comparison-callout-icon">${icon('lock', 15)}</span><div><strong>${live.debits.length} approved debit${live.debits.length === 1 ? '' : 's'}</strong><span>Manual entries and unapproved messages stay outside this view.</span></div></div>
-        <p class="analytics-footnote">This is a source-bound ledger view, not a bank statement, balance, or forecast.</p>
-      </article>
-    </div>
-    <div class="analytics-lower-grid">
       <article class="card analytics-category-card">
-        <div class="card-header"><div><span class="card-label">Category allocation</span><h3>Where the approved debits went</h3></div><span class="card-note">100% of sample</span></div>
+        <div class="card-header"><div><h2>Spending by category</h2></div>${live.debitTotal === null ? '<span class="card-note">Converted currencies only</span>' : ''}</div>
         <div class="analytics-allocation-list">
           ${categories.length ? categories.map((category, index) => analyticsAllocationRow(category.name, formatCurrency(category.amount), `${category.share.toFixed(1)}%`, Math.round(category.share), ['', 'tone-2', 'tone-3', 'tone-4', 'tone-5'][index] || 'tone-5')).join('') : '<div class="transaction-empty"><strong>No approved debit allocation</strong><p>Category allocation appears after an approved local debit.</p></div>'}
         </div>
       </article>
-      <article class="card analytics-rhythm-card">
-        <div class="card-header"><div><span class="card-label">Daily rhythm</span><h3>Recent observed debit days</h3></div><span class="card-note">EGP by observed day</span></div>
-        <div class="rhythm-chart" role="img" aria-label="Approved debit activity by observed day">
-          ${dailySeries.length ? dailySeries.map((item) => rhythmBar(new Date(`${item.date}T12:00:00Z`).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' }), formatCurrency(item.total), dailyPeak ? Math.max(3, Math.round((item.total / dailyPeak.total) * 100)) : 0, dailyPeak?.date === item.date ? 'peak' : '')).join('') : '<div class="transaction-empty"><strong>No observed daily rhythm</strong><p>A dated approved debit is needed.</p></div>'}
-        </div>
-        <div class="rhythm-note"><span class="status-dot"></span><span>${dailyPeak ? `${formatProjectionDate(dailyPeak.date)} is the highest observed debit day.` : 'No observed debit day yet.'}</span></div>
-      </article>
     </div>
-    <article class="card analytics-boundary-card">
-      <div class="card-header"><div><span class="card-label">Read this view carefully</span><h3>What Analytics can and cannot say</h3></div>${icon('lock', 17)}</div>
-      <div class="analytics-boundary-grid">
-        <div><span class="boundary-label included">Included in this prototype</span><div class="boundary-list"><div class="boundary-item"><span>${icon('check', 13)}</span><p>Dates, amounts, categories, and trends from approved debit messages.</p></div><div class="boundary-item"><span>${icon('check', 13)}</span><p>Manual entries remain outside these totals and charts.</p></div></div></div>
-        <div><span class="boundary-label excluded">Not available from this source</span><div class="boundary-list"><div class="boundary-item"><span>${icon('alert', 13)}</span><p>No bank balance, income total, or live account connection.</p></div><div class="boundary-item"><span>${icon('alert', 13)}</span><p>No unapproved messages, cash activity, or future estimate.</p></div></div></div>
-      </div>
-    </article>
-    <div class="note-row"><span>${icon('shield', 14)} Source: approved debit messages.</span><span>Manual entries remain outside Analytics.</span></div>
   </section>`;
 }
 
@@ -781,7 +1242,8 @@ function recentDebitSeries(debits, limit = 4) {
   debits.forEach((event) => {
     const date = toISODate(event.date || event.receivedAt);
     if (!date) return;
-    totalsByDate.set(date, (totalsByDate.get(date) || 0) + convertCurrency(event.amount, event.currency || 'EGP', 'EGP'));
+    const converted = convertCurrency(event.amount, event.currency || 'EGP', 'EGP');
+    if (converted !== null) totalsByDate.set(date, (totalsByDate.get(date) || 0) + converted);
   });
   return [...totalsByDate.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
@@ -820,19 +1282,16 @@ function renderReview() {
   const detail = renderReviewDetail(selectedCandidate);
   return `<section class="page" aria-labelledby="review-title">
     ${renderPageHeading({
-      eyebrow: reviewQueueEyebrow(),
+      eyebrow: '',
       title: 'Review Queue',
-      description: 'A quick human check keeps local parsing honest and keeps your data in your hands.',
-      amber: true,
-      action: `${addTransactionButton()}<button class="button button-secondary" data-view="overview">Back to overview ${icon('arrowRight', 15)}</button>`
+      description: reviewCandidates.length ? `${reviewCandidates.length} transaction${reviewCandidates.length === 1 ? '' : 's'} need your decision.` : 'No transactions need your decision.'
     })}
-    <div class="review-intro">${icon('alert', 17)}<span><strong>Open transactions need a quick check.</strong> Zoid Bank will not include uncertain text in your totals until you approve it.</span></div>
-    <div class="review-layout">
+    ${reviewCandidates.length ? `<div class="review-layout">
       <article class="card queue-card"><div class="card-header"><div><span class="card-label">Inbox</span><h3>Review items</h3></div><span class="uncertain-badge"><span class="status-dot"></span>${reviewQueueBadge()}</span></div><div class="queue-list">
-        ${reviewCandidates.length ? reviewCandidates.map((candidate) => queueItem(candidate.merchant, `${candidate.date} · Needs review`, reviewCandidateAmount(candidate), candidate.id === selectedCandidate?.id, false, candidate.id)).join('') : '<p class="queue-footer">No review items are open.</p>'}
-      </div><div class="queue-footer">Only explicitly approved messages enter the local ledger. Uncertain alerts from the local Messages source stay here.</div></article>
+        ${reviewCandidates.map((candidate) => queueItem(candidate.merchant, candidate.date, reviewCandidateAmount(candidate), candidate.id === selectedCandidate?.id, false, candidate.id)).join('')}
+      </div></article>
       <article class="card review-detail">${detail}</article>
-    </div>
+    </div>` : `<article class="card review-detail review-empty">${detail}</article>`}
   </section>`;
 }
 
@@ -852,55 +1311,52 @@ function queueItem(name, meta, amount, active, resolved, candidateId = '') {
 
 function renderReviewDetail(candidate) {
   if (!candidate) {
-    return `<div class="resolved-state"><span class="resolved-state-icon">${icon('check', 23)}</span><h2>Queue is clear</h2><p>The review state is now approved locally. Nothing was sent anywhere.</p><button class="button button-secondary" data-view="overview">Back to overview ${icon('arrowRight', 14)}</button></div>`;
+    return `<div class="resolved-state"><span class="resolved-state-icon">${icon('check', 23)}</span><h2>Queue is clear</h2><p>New uncertain transactions will appear here.</p></div>`;
   }
   const merchant = escapeHtml(candidate.merchant || 'Unresolved merchant');
   const date = escapeHtml(candidate.date || 'Unresolved date');
-  const amount = escapeHtml(formatCurrency(Math.abs(Number(candidate.amount) || 0), candidate.currency || 'EGP'));
   const category = escapeHtml(candidate.category || 'Unresolved category');
   const sender = escapeHtml(candidate.sender || 'local Messages source');
   const preview = escapeHtml(candidate.preview || 'No redacted preview available.');
   const reasons = escapeHtml((candidate.reasons || ['Needs a human check']).join(' · '));
+  const amountValue = Number(candidate.amount) > 0 ? Number(candidate.amount).toFixed(2) : '';
+  const dateValue = dateInputValue(candidate.date || candidate.receivedAt);
   return `<div class="detail-topline"><div class="detail-merchant"><span class="merchant-avatar">${escapeHtml((candidate.merchant || 'NA').slice(0, 2).toUpperCase())}</span><div><strong>${merchant}</strong><span>Parsed from ${sender} · ${date}</span></div></div><span class="uncertain-badge"><span class="status-dot"></span>Uncertain parse</span></div>
-    <p class="detail-question">Zoid Bank is not fully confident about this transaction. Check the details before it enters your totals.</p>
+    <p class="detail-question">Zoid Bank is not fully confident about this transaction. Edit the fields if needed, then approve the saved values into your local totals.</p>
     <div class="parsed-fields">
-      <div class="parsed-field"><label for="merchant">Merchant</label><input id="merchant" value="${merchant}" ${state.isEditing ? '' : 'disabled'} /></div>
-      <div class="parsed-field"><label for="amount">Amount</label><input id="amount" value="${amount}" ${state.isEditing ? '' : 'disabled'} /></div>
-      <div class="parsed-field"><label for="date">Date</label><input id="date" value="${date}" ${state.isEditing ? '' : 'disabled'} /></div>
-      <div class="parsed-field"><label for="category">Category</label><input id="category" value="${category}" ${state.isEditing ? '' : 'disabled'} /></div>
+      <div class="parsed-field"><label for="merchant">Merchant</label><input id="merchant" data-review-field="merchant" value="${merchant}" maxlength="120" ${state.isEditing ? '' : 'disabled'} /></div>
+      <div class="parsed-field"><label for="amount">Amount (${escapeHtml(candidate.currency || 'EGP')})</label><input id="amount" data-review-field="amount" type="number" min="0.01" step="0.01" value="${amountValue}" ${state.isEditing ? '' : 'disabled'} /></div>
+      <div class="parsed-field"><label for="date">Date</label><input id="date" data-review-field="date" type="date" value="${dateValue}" ${state.isEditing ? '' : 'disabled'} /></div>
+      <div class="parsed-field"><label for="category">Category</label><input id="category" data-review-field="category" value="${category}" maxlength="80" ${state.isEditing ? '' : 'disabled'} /></div>
     </div>
     <div class="source-snippet"><span>Local Messages preview · sensitive digits redacted</span><p>"${preview}"</p></div>
-    <div class="detail-actions"><p>Reason held: ${reasons}. Approval saves this event locally and does not send a reply or modify Messages.</p><div class="detail-buttons"><button class="button button-secondary" data-action="edit">${icon('edit', 14)}${state.isEditing ? 'Cancel edit' : 'Edit fields'}</button><button class="button button-amber" data-action="approve" data-candidate-id="${escapeHtml(candidate.id)}">${icon('check', 14)}${state.isEditing ? 'Save edit & approve' : 'Approve & save'}</button></div></div>`;
+    <div class="detail-actions"><p>Reason held: ${reasons}. Approval saves this event locally and does not send a reply or modify Messages.</p><div class="detail-buttons"><button class="button button-secondary" data-action="edit">${icon('edit', 14)}${state.isEditing ? 'Cancel edit' : 'Edit fields'}</button><button class="button button-dismiss" data-action="dismiss-review" data-candidate-id="${escapeHtml(candidate.id)}">Dismiss</button><button class="button button-amber" data-action="approve" data-candidate-id="${escapeHtml(candidate.id)}">${icon('check', 14)}${state.isEditing ? 'Save edit & approve' : 'Approve & save'}</button></div></div>`;
 }
 
 function renderSettings() {
+  const usdRate = state.fxRates.USD ? state.fxRates.USD.toFixed(2) : '';
+  const eurRate = state.fxRates.EUR ? state.fxRates.EUR.toFixed(2) : '';
   return `<section class="page settings-page" aria-labelledby="settings-title">
     ${renderPageHeading({
-      eyebrow: 'Workspace · Local boundary',
-      title: 'Settings, with the boundary written down',
-      description: 'Control how this private ledger is described, reviewed, and kept separate from imported bank SMS evidence.',
-      action: `<button class="button button-secondary" data-view="overview">Back to overview ${icon('arrowRight', 15)}</button>`
+      eyebrow: '',
+      title: 'Settings',
+      description: 'Choose how amounts are displayed and which manual conversion rates may be used.'
     })}
-    <div class="settings-layout">
-      <article class="card settings-section">
-        <div class="settings-section-head"><span class="settings-number">01</span><div><span class="card-label">Workspace identity</span><h2>Personal ledger</h2></div></div>
-        <p class="settings-section-copy">This prototype keeps manual entries and approved bank SMS records visibly distinct so the source of every number stays legible.</p>
-        <div class="settings-field"><label for="workspace-name">Workspace name</label><input id="workspace-name" value="Personal ledger" /></div>
-        <div class="settings-field"><label for="currency">Display currency</label><select id="currency" data-display-currency aria-label="Display currency">${currencyOptions()}</select><small class="currency-setting-note">${state.displayCurrency === 'EGP' ? 'Base currency' : `Prototype rate · EGP ${currencyDefinition(state.displayCurrency).egpPerUnit.toFixed(0)} = 1 ${state.displayCurrency}`}</small></div>
+    <div class="settings-layout distilled-settings-layout">
+      <article class="card settings-section distilled-settings-card">
+        <div class="settings-section-head"><div><h2>Display currency</h2></div></div>
+        <div class="settings-field">${currencySelect('currency')}<small class="currency-setting-note">Only EGP and currencies with a saved manual rate can be selected.</small></div>
       </article>
-      <article class="card settings-section">
-        <div class="settings-section-head"><span class="settings-number">02</span><div><span class="card-label">Evidence source</span><h2>Approved messages only</h2></div></div>
-        <div class="settings-proof"><span class="settings-proof-icon">${icon('shield', 18)}</span><div><strong>Local processing boundary</strong><span>Only approved debit messages are eligible for spending totals and recurring observations.</span></div><span class="written-state healthy">Active</span></div>
-        <div class="settings-list"><div><span>Messages reader</span><strong>Local and read-only</strong></div><div><span>Cloud sync</span><strong>Not configured</strong></div><div><span>Raw alert retention</span><strong>Redacted preview only</strong></div></div>
-      </article>
-      <article class="card settings-section">
-        <div class="settings-section-head"><span class="settings-number">03</span><div><span class="card-label">Review controls</span><h2>Keep uncertainty visible</h2></div></div>
-        <label class="settings-toggle"><input type="checkbox" checked /><span class="toggle-box"></span><span><strong>Hold uncertain parses for review</strong><small>Do not include unresolved bank SMS text in totals.</small></span></label>
-        <label class="settings-toggle"><input type="checkbox" checked /><span class="toggle-box"></span><span><strong>Label manual entries separately</strong><small>Manual notes never change approved bank SMS totals.</small></span></label>
-        <div class="settings-actions"><button class="button button-primary" data-action="settings-save">Save local preferences ${icon('check', 14)}</button><span>Saved only in this prototype session.</span></div>
+      <article class="card settings-section fx-rates-card">
+        <div class="settings-section-head"><div><span class="card-label">User-controlled source</span><h2>Manual FX rates</h2></div><span class="source-chip source-chip-review">No live feed</span></div>
+        <p class="settings-section-copy">Rates are optional local inputs. Zoid Bank will not invent a rate or convert an amount when a rate is missing.</p>
+        <form id="fx-rates-form" class="fx-rates-form">
+          <div class="parsed-field"><label for="fx-usd-rate">EGP per 1 USD</label><input id="fx-usd-rate" data-fx-rate="USD" type="number" min="0.0001" step="0.01" value="${usdRate}" placeholder="Enter a rate" /></div>
+          <div class="parsed-field"><label for="fx-eur-rate">EGP per 1 EUR</label><input id="fx-eur-rate" data-fx-rate="EUR" type="number" min="0.0001" step="0.01" value="${eurRate}" placeholder="Enter a rate" /></div>
+          <div class="fx-rates-actions"><button class="button button-primary" type="submit">Save manual rates ${icon('check', 14)}</button><span class="fx-rates-note">Leave a field empty to disable that conversion.</span></div>
+        </form>
       </article>
     </div>
-    <div class="note-row"><span>${icon('shield', 14)} Local source is available when the bridge is running.</span><span>Settings do not send or modify Messages.</span></div>
   </section>`;
 }
 
@@ -919,7 +1375,7 @@ function renderAddTransactionModal() {
     <p class="modal-description">Add a personal note for income, expense, cash, transfer, or adjustment. Manual items are stored separately from imported bank SMS messages.</p>
     <form id="manual-transaction-form">
       <div class="manual-form-grid">
-        <div class="parsed-field"><label for="manual-type">Type</label><select id="manual-type" required><option value="income">Manual income</option><option value="expense">Manual expense</option><option value="cash">Cash</option><option value="transfer">Transfer</option><option value="adjustment">Adjustment</option></select></div>
+        <div class="parsed-field">${sumiDropdown({ id: 'manual-type', label: 'Type', value: 'income', options: [{ value: 'income', label: 'Manual income' }, { value: 'expense', label: 'Manual expense' }, { value: 'cash', label: 'Cash' }, { value: 'transfer', label: 'Transfer' }, { value: 'adjustment', label: 'Adjustment' }] })}</div>
         <div class="parsed-field"><label for="manual-amount">Amount</label><input id="manual-amount" type="number" min="0.01" step="0.01" placeholder="0.00" required /></div>
         <div class="parsed-field full"><label for="manual-description">Description</label><input id="manual-description" type="text" maxlength="60" placeholder="e.g. Cash lunch" required /></div>
         <div class="parsed-field"><label for="manual-date">Date</label><input id="manual-date" type="date" value="2026-08-04" required /></div>
@@ -942,9 +1398,7 @@ function renderManualRecurringRuleModal() {
   const nextExpectedDate = existingRule?.nextExpectedDate || addDays(transaction.dateValue || transaction.meta, 30) || dateInputValue(new Date());
   const sourceLabel = existingRule?.sourceLabel || transaction.source;
   const sourceMeta = existingRule ? `${existingRule.category} · Manual rule` : `${transaction.meta} · ${transaction.category}`;
-  const cadenceOptions = manualRecurringCadenceOptions()
-    .map((cadence) => `<option value="${cadence.key}"${cadence.key === (existingRule?.cadenceKey || 'monthly') ? ' selected' : ''}>${cadence.label}</option>`)
-    .join('');
+  const cadenceOptions = manualRecurringCadenceOptions().map((cadence) => ({ value: cadence.key, label: cadence.label }));
   return `<div class="modal-backdrop" data-action="close-recurring-rule"><div class="modal recurring-rule-modal" role="dialog" aria-modal="true" aria-labelledby="manual-recurring-title">
     <div class="modal-header"><div><span class="card-label">Manual recurring rule</span><h2 id="manual-recurring-title">${existingRule ? 'Manage this recurring rule' : 'Track this transaction again'}</h2></div><button class="modal-close" data-action="close-recurring-rule" aria-label="Close">×</button></div>
     <p class="modal-description">This is a local reminder based on one approved imported debit. It never adds bank evidence, changes totals, syncs to the cloud, or makes a payment.</p>
@@ -953,7 +1407,7 @@ function renderManualRecurringRuleModal() {
       <div class="manual-form-grid">
         <div class="parsed-field full"><label for="recurring-merchant">Merchant</label><input id="recurring-merchant" value="${escapeHtml(merchant)}" readonly /></div>
         <div class="parsed-field"><label for="recurring-amount">Amount</label><input id="recurring-amount" type="number" min="0.01" step="0.01" value="${Number(amount).toFixed(2)}" required /></div>
-        <div class="parsed-field"><label for="recurring-cadence">Cadence</label><select id="recurring-cadence" required>${cadenceOptions}</select></div>
+        <div class="parsed-field">${sumiDropdown({ id: 'recurring-cadence', label: 'Cadence', value: existingRule?.cadenceKey || 'monthly', options: cadenceOptions })}</div>
         <div class="parsed-field"><label for="recurring-next-date">Next expected date</label><input id="recurring-next-date" type="date" value="${nextExpectedDate}" required /></div>
         <div class="parsed-field"><label>Evidence</label><span class="modal-source"><span class="source-chip source-chip-dark">Imported debit</span><small>One approved event · manual rule stays separate</small></span></div>
       </div>
@@ -965,20 +1419,69 @@ function renderManualRecurringRuleModal() {
 function render() {
   let page = renderOverview();
   if (state.view === 'transactions') page = renderTransactions();
+  if (state.view === 'transaction') page = renderTransactionDetail();
   if (state.view === 'analytics') page = renderAnalytics();
   if (state.view === 'recurring') page = renderRecurring();
   if (state.view === 'cash-flow') page = renderCashFlow();
   if (state.view === 'review') page = renderReview();
   if (state.view === 'settings') page = renderSettings();
-  app.innerHTML = `<div class="app-shell">${renderSidebar()}<main class="main-shell">${renderTopbar()}${page}</main></div>${renderPrototypeSwitcher()}${renderAddTransactionModal()}${renderManualRecurringRuleModal()}${state.toast ? `<div class="toast">${icon('check', 15)}${state.toast}</div>` : ''}`;
+  app.innerHTML = `<div class="app-shell${isSidebarCollapsed() ? ' sidebar-collapsed' : ''}">${renderSidebar()}<main class="main-shell">${renderTopbar()}${page}</main></div>${renderAddTransactionModal()}${renderManualRecurringRuleModal()}${state.toast ? `<div class="toast">${icon('check', 15)}${state.toast}</div>` : ''}`;
   bindEvents();
 }
 
-window.__harborLedger = harborLedger;
+exposeLedgerBridge();
 window.__harborRender = render;
 window.__harborShowToast = showToast;
 
 function bindEvents() {
+  document.querySelectorAll('[data-sumi-dropdown]').forEach((dropdown) => {
+    const trigger = dropdown.querySelector('.sumi-dropdown__trigger');
+    const options = Array.from(dropdown.querySelectorAll('.sumi-dropdown__option'));
+    trigger?.addEventListener('click', () => {
+      const shouldOpen = trigger.getAttribute('aria-expanded') !== 'true';
+      closeAllSumiDropdowns(dropdown);
+      setSumiDropdownOpen(dropdown, shouldOpen);
+    });
+    trigger?.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setSumiDropdownOpen(dropdown, false);
+        return;
+      }
+      if (!event.key.startsWith('Arrow') && event.key !== 'Home' && event.key !== 'End') return;
+      event.preventDefault();
+      event.stopPropagation();
+      setSumiDropdownOpen(dropdown, true);
+      const selectedIndex = Math.max(0, options.findIndex((option) => option.getAttribute('aria-selected') === 'true'));
+      const targetIndex = event.key === 'Home' ? 0 : event.key === 'End' ? options.length - 1 : event.key === 'ArrowUp' ? Math.max(0, selectedIndex - 1) : Math.min(options.length - 1, selectedIndex + 1);
+      options[targetIndex]?.focus();
+    });
+    options.forEach((option, optionIndex) => {
+      option.addEventListener('click', () => selectSumiDropdownOption(dropdown, option));
+      option.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          event.stopPropagation();
+          selectSumiDropdownOption(dropdown, option);
+          return;
+        }
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          setSumiDropdownOpen(dropdown, false);
+          trigger?.focus();
+          return;
+        }
+        if (!event.key.startsWith('Arrow') && event.key !== 'Home' && event.key !== 'End') return;
+        event.preventDefault();
+        event.stopPropagation();
+        const nextIndex = event.key === 'Home' ? 0 : event.key === 'End' ? options.length - 1 : event.key === 'ArrowUp' ? Math.max(0, optionIndex - 1) : Math.min(options.length - 1, optionIndex + 1);
+        options[nextIndex]?.focus();
+      });
+    });
+  });
+  document.querySelector('[data-sidebar-toggle]')?.addEventListener('click', () => {
+    setSidebarCollapsed(!state.sidebarCollapsed);
+  });
   document.querySelectorAll('[data-view]').forEach((element) => {
     element.addEventListener('click', () => setView(element.dataset.view));
   });
@@ -989,7 +1492,7 @@ function bindEvents() {
     element.addEventListener('click', () => {
       state.showAddTransaction = true;
       render();
-      document.querySelector('#manual-type')?.focus();
+      document.querySelector('#manual-type-trigger')?.focus();
     });
   });
   document.querySelectorAll('[data-action="close-add"]').forEach((element) => {
@@ -1047,6 +1550,20 @@ function bindEvents() {
       showToast(nextRules[index].paused ? 'Manual recurring rule paused locally.' : 'Manual recurring rule resumed locally.');
     });
   });
+  document.querySelectorAll('[data-action="dismiss-recurring-pattern"]').forEach((element) => {
+    element.addEventListener('click', () => {
+      const patternId = element.dataset.patternId;
+      if (!patternId || state.dismissedRecurringPatternIds.includes(patternId)) return;
+      const nextDismissedPatternIds = [...state.dismissedRecurringPatternIds, patternId];
+      if (!persistDismissedRecurringPatternIds(nextDismissedPatternIds)) {
+        showToast('The recurring pattern could not be removed locally. Check browser storage and try again.');
+        return;
+      }
+      state.dismissedRecurringPatternIds = nextDismissedPatternIds;
+      render();
+      showToast('Recurring pattern removed. Approved transactions remain unchanged.');
+    });
+  });
   document.querySelectorAll('[data-action="delete-recurring-rule"]').forEach((element) => {
     element.addEventListener('click', () => {
       const rule = state.manualRecurringRules.find((candidate) => candidate.id === element.dataset.ruleId);
@@ -1071,7 +1588,15 @@ function bindEvents() {
   document.querySelectorAll('[data-transaction-filter]').forEach((element) => {
     element.addEventListener('click', () => {
       state.transactionFilter = element.dataset.transactionFilter;
+      state.transactionPage = 1;
       render();
+    });
+  });
+  document.querySelectorAll('[data-transaction-page]').forEach((element) => {
+    element.addEventListener('click', () => {
+      state.transactionPage = Number(element.dataset.transactionPage) || 1;
+      render();
+      document.querySelector('.transaction-table-card')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
   });
   document.querySelector('#trend-timeframe')?.addEventListener('change', (event) => {
@@ -1081,12 +1606,50 @@ function bindEvents() {
   document.querySelectorAll('[data-display-currency]').forEach((element) => {
     element.addEventListener('change', (event) => {
       if (!DISPLAY_CURRENCY_BY_CODE[event.target.value]) return;
+      if (event.target.value !== 'EGP' && !state.fxRates[event.target.value]) {
+        showToast('Save a manual rate before selecting this display currency.');
+        return;
+      }
       state.displayCurrency = event.target.value;
+      persistDisplayCurrency(state.displayCurrency);
+      render();
+    });
+  });
+  document.querySelector('#fx-rates-form')?.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const nextRates = {};
+    for (const code of ['USD', 'EUR']) {
+      const value = document.querySelector(`[data-fx-rate="${code}"]`)?.value.trim() || '';
+      if (!value) continue;
+      const rate = Number(value);
+      if (!Number.isFinite(rate) || rate <= 0) {
+        showToast(`Enter a positive manual rate for ${code}, or leave it empty.`);
+        return;
+      }
+      nextRates[code] = rate;
+    }
+    if (!persistFxRates(nextRates)) {
+      showToast('Manual FX rates could not be saved locally.');
+      return;
+    }
+    state.fxRates = nextRates;
+    if (state.displayCurrency !== 'EGP' && !state.fxRates[state.displayCurrency]) {
+      state.displayCurrency = 'EGP';
+      persistDisplayCurrency('EGP');
+    }
+    render();
+    showToast('Manual FX rates saved locally.');
+  });
+  document.querySelectorAll('[data-transaction-category]').forEach((element) => {
+    element.addEventListener('change', (event) => {
+      state.transactionCategory = event.target.value;
+      state.transactionPage = 1;
       render();
     });
   });
   document.querySelector('#transaction-search')?.addEventListener('input', (event) => {
     state.transactionQuery = event.target.value;
+    state.transactionPage = 1;
     render();
     const nextSearch = document.querySelector('#transaction-search');
     nextSearch?.focus();
@@ -1096,7 +1659,22 @@ function bindEvents() {
     element.addEventListener('click', () => showToast(`${element.dataset.transactionName} selected. Structured fields stay local to this prototype.`));
   });
   document.querySelectorAll('[data-action="export-transactions"]').forEach((element) => {
-    element.addEventListener('click', () => showToast('Export stays disabled in this visual prototype.'));
+    element.addEventListener('click', async () => {
+      const items = transactionLedger().filter(transactionRowMatches);
+      if (!items.length) {
+        showToast('No matching transactions to export.');
+        return;
+      }
+      element.disabled = true;
+      try {
+        const filename = await downloadTransactionsWorkbook(items);
+        showToast(`${items.length} matching transaction${items.length === 1 ? '' : 's'} exported to ${filename}.`);
+      } catch (error) {
+        console.error('Transaction export failed.', error);
+        element.disabled = false;
+        showToast('The Excel export could not be created. Try again.');
+      }
+    });
   });
   const recurringForm = document.querySelector('#manual-recurring-form');
   recurringForm?.addEventListener('submit', (event) => {
@@ -1148,14 +1726,50 @@ function bindEvents() {
   });
   document.querySelectorAll('[data-action="approve"]').forEach((element) => {
     element.addEventListener('click', () => {
-      const result = harborLedger.approveCandidate(element.dataset.candidateId);
-      if (result.kind !== 'approved') {
-        showToast('This review item could not be approved locally.');
+      const candidateId = element.dataset.candidateId;
+      let edits = null;
+      if (state.isEditing) {
+        edits = {
+          merchant: document.querySelector('[data-review-field="merchant"]')?.value,
+          amount: document.querySelector('[data-review-field="amount"]')?.value,
+          date: document.querySelector('[data-review-field="date"]')?.value,
+          category: document.querySelector('[data-review-field="category"]')?.value
+        };
+      }
+      try {
+        const result = approveReviewCandidate(candidateId, edits);
+        if (result.kind !== 'approved') {
+          if (result.kind === 'invalid') state.isEditing = true;
+          showToast(reviewApprovalFailureMessage(result));
+          if (result.kind === 'invalid') focusReviewField(result.reasons);
+          return;
+        }
+        state.reviewCandidateId = null;
+        state.isEditing = false;
+        showToast(edits ? 'Edits saved locally. The review item is now approved.' : 'Saved locally. The review item is now approved.');
+      } catch (error) {
+        showToast(error.message || 'The review item could not be saved locally.');
         return;
       }
-      state.reviewCandidateId = null;
-      state.isEditing = false;
-      showToast('Saved locally. The review item is now approved.');
+    });
+  });
+  document.querySelectorAll('[data-action="dismiss-review"]').forEach((element) => {
+    element.addEventListener('click', () => {
+      const candidateId = element.dataset.candidateId;
+      if (!candidateId || !window.confirm('Dismiss this review item? Its source evidence and audit history will remain saved locally.')) return;
+      try {
+        const result = dismissReviewCandidate(candidateId);
+        if (result.kind !== 'dismissed') {
+          showToast('This review item is no longer available.');
+          return;
+        }
+        state.reviewCandidateId = null;
+        state.isEditing = false;
+        render();
+        showToast('Review item dismissed. Its source evidence remains saved locally.');
+      } catch (error) {
+        showToast(error.message || 'The review item could not be dismissed locally.');
+      }
     });
   });
   const form = document.querySelector('#manual-transaction-form');
@@ -1172,6 +1786,38 @@ function bindEvents() {
   });
 }
 
+function setSumiDropdownOpen(dropdown, open) {
+  const trigger = dropdown?.querySelector('.sumi-dropdown__trigger');
+  const menu = dropdown?.querySelector('.sumi-dropdown__menu');
+  if (!trigger || !menu) return;
+  trigger.setAttribute('aria-expanded', String(open));
+  menu.hidden = !open;
+}
+
+function closeAllSumiDropdowns(except = null) {
+  document.querySelectorAll('[data-sumi-dropdown]').forEach((dropdown) => {
+    if (dropdown !== except) setSumiDropdownOpen(dropdown, false);
+  });
+}
+
+function selectSumiDropdownOption(dropdown, option) {
+  const input = dropdown.querySelector('input[type="hidden"]');
+  const value = dropdown.querySelector('.sumi-dropdown__value');
+  const stateLabels = dropdown.querySelectorAll('.sumi-dropdown__state');
+  const options = dropdown.querySelectorAll('.sumi-dropdown__option');
+  if (!input || !value) return;
+  options.forEach((candidate, index) => {
+    const selected = candidate === option;
+    candidate.setAttribute('aria-selected', String(selected));
+    stateLabels[index].textContent = selected ? 'SELECTED' : '';
+  });
+  input.value = option.dataset.sumiDropdownValue;
+  value.textContent = option.querySelector('span')?.textContent || option.dataset.sumiDropdownValue;
+  setSumiDropdownOpen(dropdown, false);
+  dropdown.querySelector('.sumi-dropdown__trigger')?.focus();
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
 function formatManualDate(value) {
   const date = new Date(`${value}T12:00:00`);
   return date.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
@@ -1183,8 +1829,27 @@ window.addEventListener('keydown', (event) => {
   if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
   event.preventDefault();
   const index = views.findIndex((view) => view.id === state.view);
+  if (index < 0) {
+    setView('transactions');
+    return;
+  }
   const offset = event.key === 'ArrowRight' ? 1 : -1;
   setView(views[(index + offset + views.length) % views.length].id);
+});
+
+window.addEventListener('popstate', () => {
+  state.view = getViewFromUrl();
+  state.transactionDetailId = getTransactionIdFromUrl();
+  state.isEditing = false;
+  render();
+});
+
+window.matchMedia(SIDEBAR_COLLAPSE_MEDIA_QUERY).addEventListener('change', () => render());
+
+document.addEventListener('pointerdown', (event) => {
+  document.querySelectorAll('[data-sumi-dropdown]').forEach((dropdown) => {
+    if (!dropdown.contains(event.target)) setSumiDropdownOpen(dropdown, false);
+  });
 });
 
 render();

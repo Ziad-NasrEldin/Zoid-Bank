@@ -23,5 +23,19 @@ cat > "$AGENT_PATH" <<PLIST
 PLIST
 
 launchctl bootout "gui/$(id -u)/com.harbor.dashboard" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$AGENT_PATH"
+for _ in {1..20}; do
+  if ! /usr/sbin/lsof -nP -iTCP:4180 -sTCP:LISTEN >/dev/null 2>&1 \
+    && ! launchctl print "gui/$(id -u)/com.harbor.dashboard" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
+if /usr/sbin/lsof -nP -iTCP:4180 -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "Port 4180 is already used by another local process. Stop that process, then retry." >&2
+  exit 1
+fi
+if ! launchctl bootstrap "gui/$(id -u)" "$AGENT_PATH"; then
+  sleep 0.5
+  launchctl bootstrap "gui/$(id -u)" "$AGENT_PATH"
+fi
 echo "Zoid Bank compiled dashboard installed at http://127.0.0.1:4180"

@@ -4,7 +4,8 @@ export const MANUAL_RECURRING_CADENCES = [
   { key: 'weekly', label: 'Weekly', days: 7 },
   { key: 'biweekly', label: 'Every 2 weeks', days: 14 },
   { key: 'monthly', label: 'Monthly', days: 30 },
-  { key: 'quarterly', label: 'Quarterly', days: 90 }
+  { key: 'quarterly', label: 'Quarterly', days: 90 },
+  { key: 'yearly', label: 'Yearly', days: 365 }
 ];
 
 const CADENCE_BANDS = [
